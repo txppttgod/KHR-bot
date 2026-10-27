@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 TOKEN = os.environ["BOT_TOKEN"]
 APP_URL = os.environ.get("APP_URL", "https://txppttgod.github.io/index.html/club_app.html")
+GROUP_APP_LINK = os.environ.get("GROUP_APP_LINK", "https://t.me/Khin_raci_bot/Khinkali_Racing")
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "Khin_raci_bot").lower()
 API = f"https://api.telegram.org/bot{TOKEN}"
 CHUNK = 20  # сколько участников тегать в одном сообщении
@@ -21,16 +22,17 @@ def api(method, payload):
         return {}
 
 
-def send(chat_id, text, reply_to=None, with_button=True, entities=None):
+def send(chat_id, text, reply_to=None, with_button=True, entities=None, group=False):
     payload = {"chat_id": chat_id, "text": text}
     if entities:
         payload["entities"] = entities
     if with_button:
-        payload["reply_markup"] = {
-            "inline_keyboard": [[
-                {"text": "📊 Открыть таблицы клуба", "web_app": {"url": APP_URL}}
-            ]]
-        }
+        # В группах кнопка-ссылка на приложение надёжнее, web_app там не всегда показывается
+        if group:
+            button = {"text": "📊 Открыть таблицы клуба", "url": GROUP_APP_LINK}
+        else:
+            button = {"text": "📊 Открыть таблицы клуба", "web_app": {"url": APP_URL}}
+        payload["reply_markup"] = {"inline_keyboard": [[button]]}
     if reply_to:
         payload["reply_parameters"] = {"message_id": reply_to}
     api("sendMessage", payload)
@@ -117,7 +119,7 @@ def handle(update):
     # Группа: ответ на /start или на упоминание бота
     if lower.startswith("/start") or lower.startswith("/app") or f"@{BOT_USERNAME}" in lower:
         send(chat_id, "Таблицы клуба: правила, расписание, пилоты и сводка.",
-             reply_to=msg["message_id"])
+             reply_to=msg["message_id"], group=True)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -143,3 +145,4 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
