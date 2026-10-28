@@ -14,6 +14,8 @@ PILOTS_CSV = os.environ.get(
     "PILOTS_CSV",
     "https://docs.google.com/spreadsheets/d/e/2PACX-1vR4hL-1v8UUlMxTynXm6gtaCK0KLgjAtxmxONulVDd0HWh4khlTbzaYICkV8xr_3w/pub?gid=1543070136&single=true&output=csv",
 )
+SB_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SB_KEY = os.environ.get("SUPABASE_KEY", "")
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 CHUNK = 20              # сколько участников тегать в одном сообщении
@@ -29,13 +31,60 @@ PERM_KEYS = [
 PERMS_NONE = {k: False for k in PERM_KEYS}
 PERMS_ALL = {k: True for k in PERM_KEYS}
 
-# Данные хранятся в памяти: после перезапуска бесплатного Render они сбрасываются
-members = {}   # chat_id -> {user_id: {"id", "first_name"}} — для созыва
-stats = {}     # chat_id -> {user_id: {"name", "count"}} — активность
-warns = {}     # (chat_id, user_id) -> число предупреждений
+# ---------- База данных (Supabase) ----------
+SB_HEADERS = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}", "Content-Type": "application/json"}
+DB_OK = False  # пока база не прочитана, не сохраняем, чтобы не стереть данные
+
+
+def db_load():
+    try:
+        r = requests.get(f"{SB_URL}/rest/v1/bot_state?id=eq.main&select=data", headers=SB_HEADERS, timeout=10)
+        rows = r.json()
+        if not isinstance(rows, list) or not rows:
+            print("В базе нет строки bot_state с id=main. Выполни SQL из инструкции.")
+            return False, {}
+        return True, rows[0]["data"] or {}
+    except Exception as e:
+        print("Ошибка загрузки из базы:", e)
+        return False, {}
+
+
+def db_save(data):
+    try:
+        requests.patch(f"{SB_URL}/rest/v1/bot_state?id=eq.main", headers=SB_HEADERS,
+                       json={"data": data}, timeout=10)
+    except Exception as e:
+        print("Ошибка сохранения в базу:", e)
+
+
+def load_state():
+    global DB_OK
+    ok, d = db_load()
+    DB_OK = ok
+    members = {int(c): {int(u): v for u, v in m.items()} for c, m in d.get("members", {}).items()}
+    stats = {int(c): {int(u): v for u, v in m.items()} for c, m in d.get("stats", {}).items()}
+    warns = {}
+    for k, n in d.get("warns", {}).items():
+        c, u = k.split("_")
+        warns[(int(c), int(u))] = n
+    return members, stats, warns
+
+
+def save_state():
+    if not DB_OK:
+        return
+    db_save({
+        "members": {str(c): {str(u): v for u, v in m.items()} for c, m in members.items()},
+        "stats": {str(c): {str(u): v for u, v in m.items()} for c, m in stats.items()},
+        "warns": {f"{c}_{u}": n for (c, u), n in warns.items()},
+    })
+
+
+members, stats, warns = load_state()
 _cache = {"time": 0, "rows": []}
 
 
+# ---------- Telegram ----------
 def api(method, payload):
     try:
         return requests.post(f"{API}/{method}", json=payload, timeout=10).json()
@@ -90,6 +139,7 @@ def call_everyone(msg):
     sender_id = msg.get("from", {}).get("id")
     load_admins(chat_id)
     users = [u for u in members.get(chat_id, {}).values() if u["id"] != sender_id]
+    total = api("getChatMemberCount", {"chat_id": chat_id}).get("result", 0)
 
     if not users:
         send(chat_id, "Пока никого не знаю. Участники попадают в список, когда пишут в чат после того, как бота добавили.",
@@ -111,16 +161,43 @@ def call_everyone(msg):
             text += name + " "
         send(chat_id, text.rstrip(), with_button=False, entities=entities)
 
+    info = f"Отмечено {len(users)} из {total - 1 if total else '?'} участников."
+    if total and len(users) < total - 1:
+        info += " Кого нет в списке — пусть напишет любое сообщение в чат, и бот его запомнит."
+    send(chat_id, info, with_button=False)
+
+
+def handle_chat_member(cm):
+    # Вход и выход участников (нужны права админа и подписка на chat_member)
+    chat_id = cm["chat"]["id"]
+    new = cm.get("new_chat_member", {})
+    user = new.get("user", {})
+    status = new.get("status")
+    if status in ("member", "administrator", "creator", "restricted"):
+        remember(chat_id, user)
+    elif status in ("left", "kicked"):
+        members.get(chat_id, {}).pop(user.get("id"), None)
+
+
+# ---------- Статистика ----------
+def get_entry(chat_id, uid, name):
+    return stats.setdefault(chat_id, {}).setdefault(uid, {
+        "name": name, "count": 0, "warns": 0, "mutes": 0, "bans": 0})
+
 
 def count_activity(msg):
     user = msg.get("from") or {}
     if user.get("is_bot"):
         return
-    chat_id = msg["chat"]["id"]
-    entry = stats.setdefault(chat_id, {}).setdefault(
-        user["id"], {"name": user.get("first_name", "участник"), "count": 0})
+    entry = get_entry(msg["chat"]["id"], user["id"], user.get("first_name", "участник"))
     entry["name"] = user.get("first_name", "участник")
     entry["count"] += 1
+
+
+def record_action(chat_id, uid, name, action):
+    # action: "warn", "mute", "ban"
+    key = {"warn": "warns", "mute": "mutes", "ban": "bans"}[action]
+    get_entry(chat_id, uid, name)[key] += 1
 
 
 def reply_top(msg):
@@ -136,17 +213,26 @@ def reply_top(msg):
 
 def reply_mystats(msg):
     chat_id = msg["chat"]["id"]
-    uid = msg["from"]["id"]
+    # Без ответа — статистика отправителя; ответом на сообщение — статистика того участника
+    target = (msg.get("reply_to_message") or {}).get("from") or msg.get("from") or {}
+    uid = target.get("id")
+    name = target.get("first_name", "участник")
     board = stats.get(chat_id, {})
-    if uid not in board:
-        text = "У тебя пока нет сообщений в статистике."
+    e = board.get(uid)
+    if not e:
+        text = f"{name}: пока нет данных в статистике."
     else:
         ranked = sorted(board.items(), key=lambda kv: kv[1]["count"], reverse=True)
         place = [k for k, _ in ranked].index(uid) + 1
-        text = f"📈 Твоя активность: {board[uid]['count']} сообщений, место {place} из {len(ranked)}."
+        text = (f"📈 Статистика: {e['name']}\n"
+                f"Сообщений: {e['count']} (место {place} из {len(ranked)})\n"
+                f"Предупреждений: {e['warns']}\n"
+                f"Мутов: {e['mutes']}\n"
+                f"Банов: {e['bans']}")
     send(chat_id, text, reply_to=msg["message_id"], with_button=False)
 
 
+# ---------- Модерация ----------
 def moderate(msg, cmd, args):
     chat_id = msg["chat"]["id"]
     if not is_admin(chat_id, msg["from"]["id"]):
@@ -168,6 +254,7 @@ def moderate(msg, cmd, args):
 
     if cmd == "ban":
         api("banChatMember", {"chat_id": chat_id, "user_id": uid})
+        record_action(chat_id, uid, name, "ban")
         text = f"🔨 {name} забанен. Причина: {reason}"
     elif cmd == "unban":
         api("unbanChatMember", {"chat_id": chat_id, "user_id": uid, "only_if_banned": True})
@@ -178,6 +265,7 @@ def moderate(msg, cmd, args):
             "chat_id": chat_id, "user_id": uid, "permissions": PERMS_NONE,
             "until_date": int(time.time()) + minutes * 60,
         })
+        record_action(chat_id, uid, name, "mute")
         text = f"🔇 {name} в муте на {minutes} мин. Причина: {reason}"
     elif cmd == "unmute":
         api("restrictChatMember", {"chat_id": chat_id, "user_id": uid, "permissions": PERMS_ALL})
@@ -185,9 +273,11 @@ def moderate(msg, cmd, args):
     elif cmd == "warn":
         key = (chat_id, uid)
         warns[key] = warns.get(key, 0) + 1
+        record_action(chat_id, uid, name, "warn")
         if warns[key] >= WARN_LIMIT:
             api("banChatMember", {"chat_id": chat_id, "user_id": uid})
             warns[key] = 0
+            record_action(chat_id, uid, name, "ban")
             text = f"⚠️ {name}: {WARN_LIMIT} предупреждения, автобан. Причина: {reason}"
         else:
             text = f"⚠️ {name}, предупреждение {warns[key]} из {WARN_LIMIT}. Причина: {reason}"
@@ -199,6 +289,7 @@ def moderate(msg, cmd, args):
     send(chat_id, text, reply_to=target_msg["message_id"], with_button=False)
 
 
+# ---------- Профиль пилота из таблицы ----------
 def get_pilots():
     # Таблицу читаем не чаще раза в минуту
     if time.time() - _cache["time"] < 60:
@@ -250,15 +341,13 @@ def reply_profile(msg):
     send(msg["chat"]["id"], text, reply_to=msg["message_id"], with_button=False)
 
 
-def handle(update):
-    msg = update.get("message")
-    if not msg:
-        return
+# ---------- Основная обработка ----------
+def handle(msg):
     chat = msg["chat"]
     chat_id = chat["id"]
     is_group = chat["type"] != "private"
 
-    # Участники: вошедшие, пишущие, вышедшие
+    # Участники: вошедшие и вышедшие
     for u in msg.get("new_chat_members", []):
         remember(chat_id, u)
     if "left_chat_member" in msg:
@@ -276,12 +365,9 @@ def handle(update):
     first = words[0].split("@")[0] if words else ""
     args = text.split()[1:]
 
-    # Профиль пилота: /profile или /me
     if first in ("/profile", "/me"):
         reply_profile(msg)
         return
-
-    # Статистика активности
     if first == "/top":
         reply_top(msg)
         return
@@ -289,23 +375,19 @@ def handle(update):
         reply_mystats(msg)
         return
 
-    # Личные сообщения: ответ на /start
     if chat["type"] == "private":
         if first == "/start":
             send(chat_id, "Привет! Нажми кнопку ниже, чтобы открыть таблицы клуба.")
         return
 
-    # Модерация (только в группе, только для админов)
     if first in MOD_CMDS:
         moderate(msg, first[1:], args)
         return
 
-    # Сбор всех участников
     if lower.startswith("/all") or "созвать" in lower:
         call_everyone(msg)
         return
 
-    # Ответ на /start или упоминание бота
     if first in ("/start", "/app") or f"@{BOT_USERNAME}" in lower:
         send(chat_id, "Таблицы клуба: правила, расписание, пилоты и сводка.",
              reply_to=msg["message_id"], group=True)
@@ -315,9 +397,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         try:
-            handle(json.loads(self.rfile.read(length) or b"{}"))
+            update = json.loads(self.rfile.read(length) or b"{}")
+            if "chat_member" in update:
+                handle_chat_member(update["chat_member"])
+            elif "message" in update:
+                handle(update["message"])
         except Exception as e:
             print("Ошибка:", e)
+        save_state()
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"ok")
@@ -334,5 +421,6 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    
                 
 
