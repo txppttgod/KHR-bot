@@ -120,6 +120,7 @@ def remember(chat_id, user):
     members.setdefault(chat_id, {})[user["id"]] = {
         "id": user["id"],
         "first_name": user.get("first_name", "участник"),
+        "username": user.get("username", ""),
     }
 
 
@@ -185,6 +186,11 @@ def get_entry(chat_id, uid, name):
         "name": name, "count": 0, "warns": 0, "mutes": 0, "bans": 0})
 
 
+def day_key(days_ago=0):
+    # Дни считаем по Москве (UTC+3)
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 3 * 3600 - days_ago * 86400))
+
+
 def count_activity(msg):
     user = msg.get("from") or {}
     if user.get("is_bot"):
@@ -192,6 +198,71 @@ def count_activity(msg):
     entry = get_entry(msg["chat"]["id"], user["id"], user.get("first_name", "участник"))
     entry["name"] = user.get("first_name", "участник")
     entry["count"] += 1
+    daily = entry.setdefault("daily", {})
+    today = day_key()
+    daily[today] = daily.get(today, 0) + 1
+    cutoff = day_key(40)  # старые дни не храним, чтобы база не росла
+    for d in [d for d in daily if d < cutoff]:
+        del daily[d]
+
+
+def msgs_in_days(entry, days):
+    if not entry:
+        return 0
+    cutoff = day_key(days - 1)
+    return sum(n for d, n in entry.get("daily", {}).items() if d >= cutoff)
+
+
+def roles_by_username():
+    result = {}
+    for r in get_pilots():
+        tg = col(r, 2).lower().lstrip("@")
+        if tg != "—":
+            result[tg] = col(r, 6)
+    return result
+
+
+def reply_roster(msg):
+    chat_id = msg["chat"]["id"]
+    board = stats.get(chat_id, {})
+    roles = roles_by_username()
+    rows = []
+    for p in members.get(chat_id, {}).values():
+        e = board.get(p["id"])
+        uname = p.get("username", "")
+        rows.append({
+            "name": p["first_name"],
+            "username": uname,
+            "role": roles.get(uname.lower(), "—") if uname else "—",
+            "today": msgs_in_days(e, 1),
+            "week": msgs_in_days(e, 7),
+            "all": e["count"] if e else 0,
+        })
+    rows.sort(key=lambda r: r["all"], reverse=True)
+
+    if not rows:
+        send(chat_id, "Пока никого не знаю. Участники появятся, когда напишут в чат.", with_button=False)
+        return
+
+    head = (f"👥 Участники, которых знает бот: {len(rows)}\n"
+            f"Сообщений: сегодня {sum(r['today'] for r in rows)}, "
+            f"за неделю {sum(r['week'] for r in rows)}, всего {sum(r['all'] for r in rows)}\n"
+            "Формат: имя @ник — роль | сегодня / неделя / всего\n")
+    lines = []
+    for i, r in enumerate(rows, 1):
+        uname = f" @{r['username']}" if r["username"] else ""
+        lines.append(f"{i}. {r['name']}{uname} — {r['role']} | {r['today']} / {r['week']} / {r['all']}")
+
+    # Телеграм ограничивает длину сообщения, поэтому режем список на части
+    chunks, cur = [], head
+    for line in lines:
+        if len(cur) + len(line) + 1 > 3500:
+            chunks.append(cur)
+            cur = ""
+        cur += line + "\n"
+    chunks.append(cur)
+    for c in chunks:
+        send(chat_id, c.rstrip(), with_button=False)
 
 
 def record_action(chat_id, uid, name, action):
@@ -348,6 +419,7 @@ HELP_TEXT = """📖 Команды бота
 /all или слово «созвать» — отметить всех участников, которых бот знает
 /profile или /me — твоя карточка пилота из таблицы (можно /profile @ник)
 /top — топ-10 участников по сообщениям
+/roster — список участников: роль, сообщения за сегодня, неделю и всё время
 /stats или /mystats — статистика (ответом на сообщение — статистика того участника)
 /start или /app — кнопка с таблицами клуба
 @Khin_raci_bot — то же, что /app
@@ -387,6 +459,10 @@ def handle(msg):
     first = words[0].split("@")[0] if words else ""
     args = text.split()[1:]
 
+    if first in ("/roster", "/members"):
+        if is_group:
+            reply_roster(msg)
+        return
     if first == "/help":
         send(chat_id, HELP_TEXT, reply_to=msg["message_id"], with_button=False)
         return
@@ -446,7 +522,5 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
-    
-    
-                
+        
 
