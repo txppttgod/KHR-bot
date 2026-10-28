@@ -341,6 +341,28 @@ def reply_profile(msg):
     send(msg["chat"]["id"], text, reply_to=msg["message_id"], with_button=False)
 
 
+HELP_TEXT = """📖 Команды бота
+
+Для всех:
+/help — это сообщение
+/all или слово «созвать» — отметить всех участников, которых бот знает
+/profile или /me — твоя карточка пилота из таблицы (можно /profile @ник)
+/top — топ-10 участников по сообщениям
+/stats или /mystats — статистика (ответом на сообщение — статистика того участника)
+/start или /app — кнопка с таблицами клуба
+@Khin_raci_bot — то же, что /app
+
+Для админов группы (ответом на сообщение нарушителя):
+/ban причина — забанить
+/unban — разбанить
+/mute минуты причина — мут (по умолчанию 60 минут)
+/unmute — снять мут
+/warn причина — предупреждение, на {limit}-м бан
+/unwarn — сбросить предупреждения
+
+В личке с ботом: /start и /profile.""".format(limit=WARN_LIMIT)
+
+
 # ---------- Основная обработка ----------
 def handle(msg):
     chat = msg["chat"]
@@ -365,6 +387,9 @@ def handle(msg):
     first = words[0].split("@")[0] if words else ""
     args = text.split()[1:]
 
+    if first == "/help":
+        send(chat_id, HELP_TEXT, reply_to=msg["message_id"], with_button=False)
+        return
     if first in ("/profile", "/me"):
         reply_profile(msg)
         return
@@ -421,6 +446,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    
     
                 
 
