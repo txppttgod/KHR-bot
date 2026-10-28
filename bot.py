@@ -1,5 +1,8 @@
 import os
 import json
+import csv
+import io
+import time
 import requests
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -85,6 +88,68 @@ def call_everyone(msg):
         send(chat_id, text.rstrip(), with_button=False, entities=entities)
 
 
+PILOTS_CSV = os.environ.get(
+    "PILOTS_CSV",
+    "https://docs.google.com/spreadsheets/d/e/2PACX-1vR4hL-1v8UUlMxTynXm6gtaCK0KLgjAtxmxONulVDd0HWh4khlTbzaYICkV8xr_3w/pub?gid=1543070136&single=true&output=csv",
+)
+_cache = {"time": 0, "rows": []}
+
+
+def get_pilots():
+    # Таблицу читаем не чаще раза в минуту, чтобы не дёргать Google при каждом запросе
+    if time.time() - _cache["time"] < 60:
+        return _cache["rows"]
+    try:
+        r = requests.get(PILOTS_CSV, timeout=10)
+        r.encoding = "utf-8"
+        rows = list(csv.reader(io.StringIO(r.text)))
+        _cache["rows"] = [x for x in rows if x and x[0].strip().isdigit()]
+        _cache["time"] = time.time()
+    except Exception as e:
+        print("Ошибка чтения таблицы:", e)
+    return _cache["rows"]
+
+
+def col(r, i):
+    return r[i].strip() if len(r) > i and r[i].strip() else "—"
+
+
+def find_pilot(username):
+    uname = username.lower().lstrip("@")
+    for r in get_pilots():
+        tg = col(r, 2).lower().lstrip("@")
+        if tg != "—" and tg == uname:
+            return r
+    return None
+
+
+def reply_profile(msg):
+    parts = msg.get("text", "").split()
+    if len(parts) > 1:
+        username = parts[1]
+    else:
+        username = (msg.get("from") or {}).get("username", "")
+    username = username.lstrip("@")
+
+    if not username:
+        text = "У тебя не задан username в Телеграме. Укажи его в настройках и повтори /profile."
+    else:
+        r = find_pilot(username)
+        if r:
+            text = (
+                "👤 Профиль пилота\n"
+                f"№ {col(r, 0)} — {col(r, 1)}\n"
+                f"Телеграм: @{username}\n"
+                f"Сдано заездов: {col(r, 3)}\n"
+                f"Побед (УТС): {col(r, 4)}\n"
+                f"Всего баллов: {col(r, 5)}\n"
+                f"Роль: {col(r, 6)}"
+            )
+        else:
+            text = f"@{username} пока нет в таблице. Попроси админа добавить тебя в «Статистику пилотов»."
+    send(msg["chat"]["id"], text, reply_to=msg["message_id"], with_button=False)
+
+
 def handle(update):
     msg = update.get("message")
     if not msg:
@@ -104,6 +169,12 @@ def handle(update):
     if not text:
         return
     lower = text.lower()
+
+    # Профиль пилота по юзернейму: /profile или /me (можно /profile @ник)
+    first = lower.split()[0].split("@")[0] if lower.split() else ""
+    if first in ("/profile", "/me"):
+        reply_profile(msg)
+        return
 
     # Личные сообщения: ответ на /start
     if chat["type"] == "private":
@@ -145,4 +216,5 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
 
