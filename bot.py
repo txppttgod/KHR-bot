@@ -10,11 +10,30 @@ TOKEN = os.environ["BOT_TOKEN"]
 APP_URL = os.environ.get("APP_URL", "https://txppttgod.github.io/index.html/club_app.html")
 GROUP_APP_LINK = os.environ.get("GROUP_APP_LINK", "https://t.me/Khin_raci_bot/Khinkali_Racing")
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "Khin_raci_bot").lower()
+PILOTS_CSV = os.environ.get(
+    "PILOTS_CSV",
+    "https://docs.google.com/spreadsheets/d/e/2PACX-1vR4hL-1v8UUlMxTynXm6gtaCK0KLgjAtxmxONulVDd0HWh4khlTbzaYICkV8xr_3w/pub?gid=1543070136&single=true&output=csv",
+)
 API = f"https://api.telegram.org/bot{TOKEN}"
-CHUNK = 20  # сколько участников тегать в одном сообщении
 
-# chat_id -> {user_id: {"id": ..., "first_name": ...}}
-members = {}
+CHUNK = 20              # сколько участников тегать в одном сообщении
+WARN_LIMIT = 3          # сколько предупреждений до автобана
+MUTE_DEFAULT_MIN = 60   # мут по умолчанию, в минутах
+MOD_CMDS = {"/ban", "/unban", "/mute", "/unmute", "/warn", "/unwarn"}
+PERM_KEYS = [
+    "can_send_messages", "can_send_audios", "can_send_documents", "can_send_photos",
+    "can_send_videos", "can_send_video_notes", "can_send_voice_notes", "can_send_polls",
+    "can_send_other_messages", "can_add_web_page_previews", "can_change_info",
+    "can_invite_users", "can_pin_messages", "can_manage_topics",
+]
+PERMS_NONE = {k: False for k in PERM_KEYS}
+PERMS_ALL = {k: True for k in PERM_KEYS}
+
+# Данные хранятся в памяти: после перезапуска бесплатного Render они сбрасываются
+members = {}   # chat_id -> {user_id: {"id", "first_name"}} — для созыва
+stats = {}     # chat_id -> {user_id: {"name", "count"}} — активность
+warns = {}     # (chat_id, user_id) -> число предупреждений
+_cache = {"time": 0, "rows": []}
 
 
 def api(method, payload):
@@ -30,7 +49,7 @@ def send(chat_id, text, reply_to=None, with_button=True, entities=None, group=Fa
     if entities:
         payload["entities"] = entities
     if with_button:
-        # В группах кнопка-ссылка на приложение надёжнее, web_app там не всегда показывается
+        # В группах кнопка-ссылка надёжнее, web_app там не всегда показывается
         if group:
             button = {"text": "📊 Открыть таблицы клуба", "url": GROUP_APP_LINK}
         else:
@@ -42,7 +61,7 @@ def send(chat_id, text, reply_to=None, with_button=True, entities=None, group=Fa
 
 
 def utf16_len(s):
-    # Telegram считает смещения в UTF-16, поэтому эмодзи считаются как 2 символа
+    # Telegram считает смещения в UTF-16, эмодзи занимают 2 символа
     return len(s.encode("utf-16-le")) // 2
 
 
@@ -59,6 +78,11 @@ def load_admins(chat_id):
     res = api("getChatAdministrators", {"chat_id": chat_id})
     for m in res.get("result", []):
         remember(chat_id, m.get("user"))
+
+
+def is_admin(chat_id, user_id):
+    res = api("getChatMember", {"chat_id": chat_id, "user_id": user_id})
+    return res.get("result", {}).get("status") in ("creator", "administrator")
 
 
 def call_everyone(msg):
@@ -88,15 +112,95 @@ def call_everyone(msg):
         send(chat_id, text.rstrip(), with_button=False, entities=entities)
 
 
-PILOTS_CSV = os.environ.get(
-    "PILOTS_CSV",
-    "https://docs.google.com/spreadsheets/d/e/2PACX-1vR4hL-1v8UUlMxTynXm6gtaCK0KLgjAtxmxONulVDd0HWh4khlTbzaYICkV8xr_3w/pub?gid=1543070136&single=true&output=csv",
-)
-_cache = {"time": 0, "rows": []}
+def count_activity(msg):
+    user = msg.get("from") or {}
+    if user.get("is_bot"):
+        return
+    chat_id = msg["chat"]["id"]
+    entry = stats.setdefault(chat_id, {}).setdefault(
+        user["id"], {"name": user.get("first_name", "участник"), "count": 0})
+    entry["name"] = user.get("first_name", "участник")
+    entry["count"] += 1
+
+
+def reply_top(msg):
+    chat_id = msg["chat"]["id"]
+    rows = sorted(stats.get(chat_id, {}).values(), key=lambda d: d["count"], reverse=True)[:10]
+    if not rows:
+        text = "Пока нет статистики. Она считается с момента, как бот добавлен в группу."
+    else:
+        text = "📊 Топ-10 по сообщениям:\n" + "\n".join(
+            f"{i}. {d['name']} — {d['count']}" for i, d in enumerate(rows, 1))
+    send(chat_id, text, reply_to=msg["message_id"], with_button=False)
+
+
+def reply_mystats(msg):
+    chat_id = msg["chat"]["id"]
+    uid = msg["from"]["id"]
+    board = stats.get(chat_id, {})
+    if uid not in board:
+        text = "У тебя пока нет сообщений в статистике."
+    else:
+        ranked = sorted(board.items(), key=lambda kv: kv[1]["count"], reverse=True)
+        place = [k for k, _ in ranked].index(uid) + 1
+        text = f"📈 Твоя активность: {board[uid]['count']} сообщений, место {place} из {len(ranked)}."
+    send(chat_id, text, reply_to=msg["message_id"], with_button=False)
+
+
+def moderate(msg, cmd, args):
+    chat_id = msg["chat"]["id"]
+    if not is_admin(chat_id, msg["from"]["id"]):
+        send(chat_id, "Эта команда только для админов группы.", reply_to=msg["message_id"], with_button=False)
+        return
+    target_msg = msg.get("reply_to_message")
+    if not target_msg or not target_msg.get("from"):
+        send(chat_id, "Ответь этой командой на сообщение нарушителя.", reply_to=msg["message_id"], with_button=False)
+        return
+    target = target_msg["from"]
+    if target.get("is_bot") or is_admin(chat_id, target["id"]):
+        send(chat_id, "Нельзя применить это к админу или боту.", reply_to=msg["message_id"], with_button=False)
+        return
+
+    uid = target["id"]
+    name = target.get("first_name", "участник")
+    has_minutes = cmd == "mute" and args and args[0].isdigit()
+    reason = " ".join(args[1:] if has_minutes else args) or "не указана"
+
+    if cmd == "ban":
+        api("banChatMember", {"chat_id": chat_id, "user_id": uid})
+        text = f"🔨 {name} забанен. Причина: {reason}"
+    elif cmd == "unban":
+        api("unbanChatMember", {"chat_id": chat_id, "user_id": uid, "only_if_banned": True})
+        text = f"✅ {name} разбанен."
+    elif cmd == "mute":
+        minutes = max(1, int(args[0])) if has_minutes else MUTE_DEFAULT_MIN
+        api("restrictChatMember", {
+            "chat_id": chat_id, "user_id": uid, "permissions": PERMS_NONE,
+            "until_date": int(time.time()) + minutes * 60,
+        })
+        text = f"🔇 {name} в муте на {minutes} мин. Причина: {reason}"
+    elif cmd == "unmute":
+        api("restrictChatMember", {"chat_id": chat_id, "user_id": uid, "permissions": PERMS_ALL})
+        text = f"🔊 {name} снова может писать."
+    elif cmd == "warn":
+        key = (chat_id, uid)
+        warns[key] = warns.get(key, 0) + 1
+        if warns[key] >= WARN_LIMIT:
+            api("banChatMember", {"chat_id": chat_id, "user_id": uid})
+            warns[key] = 0
+            text = f"⚠️ {name}: {WARN_LIMIT} предупреждения, автобан. Причина: {reason}"
+        else:
+            text = f"⚠️ {name}, предупреждение {warns[key]} из {WARN_LIMIT}. Причина: {reason}"
+    elif cmd == "unwarn":
+        warns[(chat_id, uid)] = 0
+        text = f"Предупреждения {name} сняты."
+    else:
+        return
+    send(chat_id, text, reply_to=target_msg["message_id"], with_button=False)
 
 
 def get_pilots():
-    # Таблицу читаем не чаще раза в минуту, чтобы не дёргать Google при каждом запросе
+    # Таблицу читаем не чаще раза в минуту
     if time.time() - _cache["time"] < 60:
         return _cache["rows"]
     try:
@@ -125,12 +229,8 @@ def find_pilot(username):
 
 def reply_profile(msg):
     parts = msg.get("text", "").split()
-    if len(parts) > 1:
-        username = parts[1]
-    else:
-        username = (msg.get("from") or {}).get("username", "")
+    username = parts[1] if len(parts) > 1 else (msg.get("from") or {}).get("username", "")
     username = username.lstrip("@")
-
     if not username:
         text = "У тебя не задан username в Телеграме. Укажи его в настройках и повтори /profile."
     else:
@@ -156,39 +256,57 @@ def handle(update):
         return
     chat = msg["chat"]
     chat_id = chat["id"]
+    is_group = chat["type"] != "private"
 
-    # Запоминаем участников: вошедших, пишущих и вышедших
+    # Участники: вошедшие, пишущие, вышедшие
     for u in msg.get("new_chat_members", []):
         remember(chat_id, u)
     if "left_chat_member" in msg:
         members.get(chat_id, {}).pop(msg["left_chat_member"]["id"], None)
-    if chat["type"] != "private" and "from" in msg:
+    service = "new_chat_members" in msg or "left_chat_member" in msg
+    if is_group and "from" in msg and not service:
         remember(chat_id, msg["from"])
+        count_activity(msg)
 
     text = msg.get("text", "")
     if not text:
         return
     lower = text.lower()
+    words = lower.split()
+    first = words[0].split("@")[0] if words else ""
+    args = text.split()[1:]
 
-    # Профиль пилота по юзернейму: /profile или /me (можно /profile @ник)
-    first = lower.split()[0].split("@")[0] if lower.split() else ""
+    # Профиль пилота: /profile или /me
     if first in ("/profile", "/me"):
         reply_profile(msg)
         return
 
+    # Статистика активности
+    if first == "/top":
+        reply_top(msg)
+        return
+    if first in ("/stats", "/mystats"):
+        reply_mystats(msg)
+        return
+
     # Личные сообщения: ответ на /start
     if chat["type"] == "private":
-        if lower.startswith("/start"):
+        if first == "/start":
             send(chat_id, "Привет! Нажми кнопку ниже, чтобы открыть таблицы клуба.")
         return
 
-    # Группа: сбор всех участников по слову «созвать» или команде /all
+    # Модерация (только в группе, только для админов)
+    if first in MOD_CMDS:
+        moderate(msg, first[1:], args)
+        return
+
+    # Сбор всех участников
     if lower.startswith("/all") or "созвать" in lower:
         call_everyone(msg)
         return
 
-    # Группа: ответ на /start или на упоминание бота
-    if lower.startswith("/start") or lower.startswith("/app") or f"@{BOT_USERNAME}" in lower:
+    # Ответ на /start или упоминание бота
+    if first in ("/start", "/app") or f"@{BOT_USERNAME}" in lower:
         send(chat_id, "Таблицы клуба: правила, расписание, пилоты и сводка.",
              reply_to=msg["message_id"], group=True)
 
@@ -216,5 +334,5 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
-
+                
 
