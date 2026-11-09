@@ -32,16 +32,26 @@ PERMS_NONE = {k: False for k in PERM_KEYS}
 PERMS_ALL = {k: True for k in PERM_KEYS}
 
 # ---------- База данных (Supabase) ----------
-SB_HEADERS = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}", "Content-Type": "application/json"}
-DB_OK = False  # пока база не прочитана, не сохраняем, чтобы не стереть данные
+SB_HEADERS = {"apikey": SB_KEY, "Content-Type": "application/json"}
+if SB_KEY.startswith("eyJ"):
+    # Старые ключи (service_role) — это JWT, их передают ещё и в Authorization.
+    # Новые ключи sb_secret_... в Authorization класть нельзя, Supabase их там отклоняет.
+    SB_HEADERS["Authorization"] = f"Bearer {SB_KEY}"
+DB_OK = False  # прочитана ли база перед текущим сообщением; если нет — не сохраняем, чтобы не стереть данные
 
 
 def db_load():
+    if not SB_URL or not SB_KEY:
+        print("Не заданы SUPABASE_URL или SUPABASE_KEY в Render → Environment. Данные не сохраняются!")
+        return False, {}
     try:
-        r = requests.get(f"{SB_URL}/rest/v1/bot_state?id=eq.main&select=data", headers=SB_HEADERS, timeout=10)
+        r = requests.get(f"{SB_URL}/rest/v1/bot_state?id=eq.main&select=data", headers=SB_HEADERS, timeout=15)
         rows = r.json()
-        if not isinstance(rows, list) or not rows:
-            print("В базе нет строки bot_state с id=main. Выполни SQL из инструкции.")
+        if not isinstance(rows, list):
+            print(f"Ошибка загрузки из базы: HTTP {r.status_code} {r.text[:300]}")
+            return False, {}
+        if not rows:
+            print("В базе нет строки bot_state с id=main (или ключ не даёт её прочитать). Выполни SQL из инструкции.")
             return False, {}
         return True, rows[0]["data"] or {}
     except Exception as e:
@@ -51,23 +61,29 @@ def db_load():
 
 def db_save(data):
     try:
-        requests.patch(f"{SB_URL}/rest/v1/bot_state?id=eq.main", headers=SB_HEADERS,
-                       json={"data": data}, timeout=10)
+        r = requests.patch(f"{SB_URL}/rest/v1/bot_state?id=eq.main", headers=SB_HEADERS,
+                           json={"data": data}, timeout=15)
+        if r.status_code >= 300:
+            print(f"Ошибка сохранения в базу: HTTP {r.status_code} {r.text[:300]}")
     except Exception as e:
         print("Ошибка сохранения в базу:", e)
 
 
 def load_state():
-    global DB_OK
+    # Читаем базу перед каждым сообщением. Раньше она читалась один раз при запуске,
+    # и если в этот момент Supabase не ответил, бот до перезапуска ничего не сохранял.
+    # Так же не теряются данные, когда Render при деплое ненадолго держит две копии бота.
+    global DB_OK, members, stats, warns
     ok, d = db_load()
     DB_OK = ok
+    if not ok:
+        return
     members = {int(c): {int(u): v for u, v in m.items()} for c, m in d.get("members", {}).items()}
     stats = {int(c): {int(u): v for u, v in m.items()} for c, m in d.get("stats", {}).items()}
     warns = {}
     for k, n in d.get("warns", {}).items():
         c, u = k.split("_")
         warns[(int(c), int(u))] = n
-    return members, stats, warns
 
 
 def save_state():
@@ -80,7 +96,8 @@ def save_state():
     })
 
 
-members, stats, warns = load_state()
+members, stats, warns = {}, {}, {}
+load_state()
 _cache = {"time": 0, "rows": []}
 
 
@@ -450,6 +467,12 @@ def handle(msg):
     if is_group and "from" in msg and not service:
         remember(chat_id, msg["from"])
         count_activity(msg)
+    if is_group:
+        # Запоминаем и тех, на чьё сообщение ответили, и тех, кого отметили без @ника
+        remember(chat_id, (msg.get("reply_to_message") or {}).get("from"))
+        for ent in msg.get("entities", []):
+            if ent.get("type") == "text_mention":
+                remember(chat_id, ent.get("user"))
 
     text = msg.get("text", "")
     if not text:
@@ -499,6 +522,7 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         try:
             update = json.loads(self.rfile.read(length) or b"{}")
+            load_state()
             if "chat_member" in update:
                 handle_chat_member(update["chat_member"])
             elif "message" in update:
@@ -519,8 +543,25 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def setup_webhook():
+    # Render сам сообщает адрес сервиса. Подписываемся на сообщения и на вход/выход участников,
+    # чтобы не настраивать это вручную ссылкой setWebhook.
+    url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if url:
+        res = api("setWebhook", {"url": url + "/", "allowed_updates": ["message", "chat_member"]})
+        print("Вебхук:", "настроен" if res.get("ok") else res)
+    info = api("getWebhookInfo", {}).get("result", {})
+    if info.get("last_error_message"):
+        print("Последняя ошибка вебхука у Телеграма:", info["last_error_message"])
+    me = api("getMe", {}).get("result", {})
+    if me and not me.get("can_read_all_group_messages"):
+        print("Внимание: у бота включена приватность. Если он не админ группы, он не видит обычные "
+              "сообщения и не запоминает участников. BotFather → /setprivacy → Disable или сделай бота админом.")
+    print("База данных:", "подключена" if DB_OK else "НЕ подключена, смотри ошибку выше")
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+    setup_webhook()
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
-        
 
