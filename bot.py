@@ -3,6 +3,7 @@ import sys
 import json
 import csv
 import io
+import re
 import time
 import requests
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -25,7 +26,8 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 CHUNK = 20              # сколько участников тегать в одном сообщении
 WARN_LIMIT = 3          # сколько предупреждений до автобана
 MUTE_DEFAULT_MIN = 60   # мут по умолчанию, в минутах
-MOD_CMDS = {"/ban", "/unban", "/mute", "/unmute", "/warn", "/unwarn"}
+MODLOG_SIZE = 50        # сколько последних действий модерации хранить на чат
+MAX_ROLES = 5           # сколько должностей можно дать одному человеку
 PERM_KEYS = [
     "can_send_messages", "can_send_audios", "can_send_documents", "can_send_photos",
     "can_send_videos", "can_send_video_notes", "can_send_voice_notes", "can_send_polls",
@@ -34,6 +36,13 @@ PERM_KEYS = [
 ]
 PERMS_NONE = {k: False for k in PERM_KEYS}
 PERMS_ALL = {k: True for k in PERM_KEYS}
+
+# Уровни в системе бота. Владелец группы всегда 3, админы Телеграма минимум 2.
+LEVELS = {0: "Участник", 1: "Модератор", 2: "Администратор", 3: "Владелец"}
+LEVEL_ICONS = {1: "🛡", 2: "⭐", 3: "👑"}
+
+DEFAULT_WELCOME = ("Добро пожаловать в клуб, {name}! 🏁\n"
+                   "Правила — /rules, все команды — /help. Таблицы клуба — по кнопке ниже.")
 
 # ---------- База данных (Supabase) ----------
 SB_HEADERS = {"apikey": SB_KEY, "Content-Type": "application/json"}
@@ -73,17 +82,34 @@ def db_save(data):
         print("Ошибка сохранения в базу:", e)
 
 
+def int_keys(d, depth=2):
+    # В JSON ключи — строки, а в коде id чатов и людей — числа
+    if depth == 0 or not isinstance(d, dict):
+        return d
+    return {int(k): int_keys(v, depth - 1) for k, v in d.items()}
+
+
+def str_keys(d, depth=2):
+    if depth == 0 or not isinstance(d, dict):
+        return d
+    return {str(k): str_keys(v, depth - 1) for k, v in d.items()}
+
+
 def load_state():
     # Читаем базу перед каждым сообщением. Раньше она читалась один раз при запуске,
     # и если в этот момент Supabase не ответил, бот до перезапуска ничего не сохранял.
     # Так же не теряются данные, когда Render при деплое ненадолго держит две копии бота.
-    global DB_OK, members, stats, warns
+    global DB_OK, members, stats, warns, staff, roles, settings, modlog
     ok, d = db_load()
     DB_OK = ok
     if not ok:
         return
-    members = {int(c): {int(u): v for u, v in m.items()} for c, m in d.get("members", {}).items()}
-    stats = {int(c): {int(u): v for u, v in m.items()} for c, m in d.get("stats", {}).items()}
+    members = int_keys(d.get("members", {}))
+    stats = int_keys(d.get("stats", {}))
+    staff = int_keys(d.get("staff", {}))        # чат → {человек: уровень}
+    roles = int_keys(d.get("roles", {}))        # чат → {человек: [должности]}
+    settings = int_keys(d.get("settings", {}), 1)  # чат → {rules, welcome, welcome_off}
+    modlog = int_keys(d.get("modlog", {}), 1)      # чат → [последние действия]
     warns = {}
     for k, n in d.get("warns", {}).items():
         c, u = k.split("_")
@@ -94,13 +120,17 @@ def save_state():
     if not DB_OK:
         return
     db_save({
-        "members": {str(c): {str(u): v for u, v in m.items()} for c, m in members.items()},
-        "stats": {str(c): {str(u): v for u, v in m.items()} for c, m in stats.items()},
+        "members": str_keys(members),
+        "stats": str_keys(stats),
+        "staff": str_keys(staff),
+        "roles": str_keys(roles),
+        "settings": str_keys(settings, 1),
+        "modlog": str_keys(modlog, 1),
         "warns": {f"{c}_{u}": n for (c, u), n in warns.items()},
     })
 
 
-members, stats, warns = {}, {}, {}
+members, stats, warns, staff, roles, settings, modlog = {}, {}, {}, {}, {}, {}, {}
 load_state()
 _cache = {"time": 0, "rows": []}
 
@@ -126,13 +156,32 @@ def send(chat_id, text, reply_to=None, with_button=True, entities=None, group=Fa
             button = {"text": "📊 Открыть таблицы клуба", "web_app": {"url": APP_URL}}
         payload["reply_markup"] = {"inline_keyboard": [[button]]}
     if reply_to:
-        payload["reply_parameters"] = {"message_id": reply_to}
-    api("sendMessage", payload)
+        payload["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
+    return api("sendMessage", payload)
+
+
+def reply(msg, text, entities=None):
+    send(msg["chat"]["id"], text, reply_to=msg["message_id"], with_button=False, entities=entities)
 
 
 def utf16_len(s):
     # Telegram считает смещения в UTF-16, эмодзи занимают 2 символа
     return len(s.encode("utf-16-le")) // 2
+
+
+def with_mentions(prefix, users, sep=" "):
+    # Текст с кликабельными именами: работает и для людей без @ника
+    text, entities = prefix, []
+    for u in users:
+        name = name_of(u)
+        entities.append({"type": "text_mention", "offset": utf16_len(text), "length": utf16_len(name),
+                         "user": {"id": u["id"], "first_name": name}})
+        text += name + sep
+    return text.rstrip(), entities
+
+
+def name_of(user):
+    return (user or {}).get("first_name") or (user or {}).get("username") or "участник"
 
 
 def remember(chat_id, user):
@@ -145,15 +194,77 @@ def remember(chat_id, user):
     }
 
 
-def load_admins(chat_id):
+def get_admins(chat_id):
     res = api("getChatAdministrators", {"chat_id": chat_id})
-    for m in res.get("result", []):
+    return [m for m in res.get("result", []) if not m.get("user", {}).get("is_bot")]
+
+
+def load_admins(chat_id):
+    for m in get_admins(chat_id):
         remember(chat_id, m.get("user"))
 
 
-def is_admin(chat_id, user_id):
-    res = api("getChatMember", {"chat_id": chat_id, "user_id": user_id})
-    return res.get("result", {}).get("status") in ("creator", "administrator")
+def get_level(chat_id, uid):
+    res = api("getChatMember", {"chat_id": chat_id, "user_id": uid}).get("result", {})
+    status = res.get("status")
+    if status == "creator":
+        return 3
+    own = staff.get(chat_id, {}).get(uid, 0)
+    return max(own, 2) if status == "administrator" else own
+
+
+def find_target(msg, args):
+    # Цель команды: ответ на сообщение, @ник, упоминание без ника или id.
+    # Возвращает (человек или None, оставшиеся аргументы)
+    chat_id = msg["chat"]["id"]
+    rep = (msg.get("reply_to_message") or {}).get("from")
+    if rep:
+        return rep, args
+    for ent in msg.get("entities", []):
+        if ent.get("type") == "text_mention":
+            # Имя-упоминание занимает в тексте одно или несколько слов: убираем их из аргументов
+            words = len(name_of(ent["user"]).split())
+            return ent["user"], args[words:]
+    if args:
+        a = args[0]
+        if a.startswith("@"):
+            uname = a[1:].lower()
+            for u in members.get(chat_id, {}).values():
+                if u.get("username", "").lower() == uname:
+                    return dict(u), args[1:]
+        elif a.isdigit() and len(a) >= 5:
+            uid = int(a)
+            return dict(members.get(chat_id, {}).get(uid, {"id": uid, "first_name": a})), args[1:]
+    return None, args
+
+
+DUR_UNITS = {"": 60, "m": 60, "м": 60, "min": 60, "мин": 60,
+             "h": 3600, "ч": 3600, "d": 86400, "д": 86400}
+
+
+def parse_duration(args):
+    # «30», «30m», «2ч», «1д» → секунды. Возвращает (секунды или None, оставшиеся аргументы)
+    if args:
+        m = re.fullmatch(r"(\d+)([a-zа-я]*)", args[0].lower())
+        if m and m.group(2) in DUR_UNITS:
+            return int(m.group(1)) * DUR_UNITS[m.group(2)], args[1:]
+    return None, args
+
+
+def fmt_duration(sec):
+    if sec % 86400 == 0:
+        return f"{sec // 86400} дн"
+    if sec % 3600 == 0:
+        return f"{sec // 3600} ч"
+    return f"{sec // 60} мин"
+
+
+def text_after_command(msg):
+    # Всё, что после команды, с сохранением переносов строк; или текст сообщения, на которое ответили
+    parts = msg.get("text", "").split(None, 1)
+    if len(parts) > 1:
+        return parts[1].strip()
+    return ((msg.get("reply_to_message") or {}).get("text") or "").strip()
 
 
 def call_everyone(msg):
@@ -169,24 +280,21 @@ def call_everyone(msg):
         return
 
     for start in range(0, len(users), CHUNK):
-        chunk = users[start:start + CHUNK]
-        text = "🚨 Общий сбор! " if start == 0 else ""
-        entities = []
-        for u in chunk:
-            name = u["first_name"]
-            entities.append({
-                "type": "text_mention",
-                "offset": utf16_len(text),
-                "length": utf16_len(name),
-                "user": {"id": u["id"], "first_name": name},
-            })
-            text += name + " "
-        send(chat_id, text.rstrip(), with_button=False, entities=entities)
+        text, entities = with_mentions("🚨 Общий сбор! " if start == 0 else "", users[start:start + CHUNK])
+        send(chat_id, text, with_button=False, entities=entities)
 
     info = f"Отмечено {len(users)} из {total - 1 if total else '?'} участников."
     if total and len(users) < total - 1:
         info += " Кого нет в списке — пусть напишет любое сообщение в чат, и бот его запомнит."
     send(chat_id, info, with_button=False)
+
+
+def welcome(chat_id, user):
+    conf = settings.get(chat_id, {})
+    if conf.get("welcome_off") or user.get("is_bot"):
+        return
+    text = (conf.get("welcome") or DEFAULT_WELCOME).replace("{name}", name_of(user))
+    send(chat_id, text, group=True)
 
 
 def handle_chat_member(cm):
@@ -243,18 +351,28 @@ def roles_by_username():
     return result
 
 
+def club_roles(chat_id, user, table_roles=None):
+    # Должности из бота; если их не задали — роль из таблицы «Статистика пилотов»
+    own = roles.get(chat_id, {}).get(user["id"], [])
+    if own:
+        return ", ".join(own)
+    uname = (user.get("username") or "").lower()
+    if table_roles is None:
+        table_roles = roles_by_username()
+    return table_roles.get(uname, "—") if uname else "—"
+
+
 def reply_roster(msg):
     chat_id = msg["chat"]["id"]
     board = stats.get(chat_id, {})
-    roles = roles_by_username()
+    table_roles = roles_by_username()
     rows = []
     for p in members.get(chat_id, {}).values():
         e = board.get(p["id"])
-        uname = p.get("username", "")
         rows.append({
             "name": p["first_name"],
-            "username": uname,
-            "role": roles.get(uname.lower(), "—") if uname else "—",
+            "username": p.get("username", ""),
+            "role": club_roles(chat_id, p, table_roles),
             "today": msgs_in_days(e, 1),
             "week": msgs_in_days(e, 7),
             "all": e["count"] if e else 0,
@@ -268,12 +386,15 @@ def reply_roster(msg):
     head = (f"👥 Участники, которых знает бот: {len(rows)}\n"
             f"Сообщений: сегодня {sum(r['today'] for r in rows)}, "
             f"за неделю {sum(r['week'] for r in rows)}, всего {sum(r['all'] for r in rows)}\n"
-            "Формат: имя @ник — роль | сегодня / неделя / всего\n")
+            "Формат: имя @ник — должность | сегодня / неделя / всего\n")
     lines = []
     for i, r in enumerate(rows, 1):
         uname = f" @{r['username']}" if r["username"] else ""
         lines.append(f"{i}. {r['name']}{uname} — {r['role']} | {r['today']} / {r['week']} / {r['all']}")
+    send_long(chat_id, head, lines)
 
+
+def send_long(chat_id, head, lines):
     # Телеграм ограничивает длину сообщения, поэтому режем список на части
     chunks, cur = [], head
     for line in lines:
@@ -300,7 +421,7 @@ def reply_top(msg):
     else:
         text = "📊 Топ-10 по сообщениям:\n" + "\n".join(
             f"{i}. {d['name']} — {d['count']}" for i, d in enumerate(rows, 1))
-    send(chat_id, text, reply_to=msg["message_id"], with_button=False)
+    reply(msg, text)
 
 
 def reply_mystats(msg):
@@ -321,64 +442,362 @@ def reply_mystats(msg):
                 f"Предупреждений: {e['warns']}\n"
                 f"Мутов: {e['mutes']}\n"
                 f"Банов: {e['bans']}")
-    send(chat_id, text, reply_to=msg["message_id"], with_button=False)
+    reply(msg, text)
 
 
 # ---------- Модерация ----------
-def moderate(msg, cmd, args):
+def tg(msg, method, payload):
+    # Вызов Телеграма с понятным ответом, если у бота не хватает прав
+    res = api(method, payload)
+    if not res.get("ok"):
+        reply(msg, "Телеграм не дал это сделать: " + res.get("description", "нет ответа") +
+              "\nПроверь, что бот — админ группы с нужными правами.")
+        return False
+    return True
+
+
+def log_action(msg, target, action, reason=""):
+    lst = modlog.setdefault(msg["chat"]["id"], [])
+    lst.append({"t": int(time.time()), "by": name_of(msg.get("from")), "who": name_of(target) if target else "",
+                "uid": target["id"] if target else 0, "act": action, "why": reason})
+    del lst[:-MODLOG_SIZE]
+
+
+def pick_target(msg, args, my, check_level=True):
+    target, rest = find_target(msg, args)
+    if not target:
+        reply(msg, "Ответь командой на сообщение участника или укажи @ник.")
+        return None, rest
+    if target.get("is_bot"):
+        reply(msg, "Это бот, к нему команда не применяется.")
+        return None, rest
+    if check_level and get_level(msg["chat"]["id"], target["id"]) >= my:
+        reply(msg, "Нельзя: у этого участника такой же или более высокий уровень. Кто есть кто — /staff")
+        return None, rest
+    return target, rest
+
+
+def cmd_ban(msg, args, my):
     chat_id = msg["chat"]["id"]
-    if not is_admin(chat_id, msg["from"]["id"]):
-        send(chat_id, "Эта команда только для админов группы.", reply_to=msg["message_id"], with_button=False)
+    target, rest = pick_target(msg, args, my)
+    if not target:
         return
-    target_msg = msg.get("reply_to_message")
-    if not target_msg or not target_msg.get("from"):
-        send(chat_id, "Ответь этой командой на сообщение нарушителя.", reply_to=msg["message_id"], with_button=False)
+    dur, rest = parse_duration(rest)
+    reason = " ".join(rest) or "не указана"
+    payload = {"chat_id": chat_id, "user_id": target["id"]}
+    if dur:
+        payload["until_date"] = int(time.time()) + dur
+    if not tg(msg, "banChatMember", payload):
         return
-    target = target_msg["from"]
-    if target.get("is_bot") or is_admin(chat_id, target["id"]):
-        send(chat_id, "Нельзя применить это к админу или боту.", reply_to=msg["message_id"], with_button=False)
-        return
+    record_action(chat_id, target["id"], name_of(target), "ban")
+    members.get(chat_id, {}).pop(target["id"], None)
+    term = f" на {fmt_duration(dur)}" if dur else ""
+    log_action(msg, target, "бан" + term, reason)
+    reply(msg, f"🔨 {name_of(target)} забанен{term}. Причина: {reason}")
 
-    uid = target["id"]
-    name = target.get("first_name", "участник")
-    has_minutes = cmd == "mute" and args and args[0].isdigit()
-    reason = " ".join(args[1:] if has_minutes else args) or "не указана"
 
-    if cmd == "ban":
-        api("banChatMember", {"chat_id": chat_id, "user_id": uid})
-        record_action(chat_id, uid, name, "ban")
-        text = f"🔨 {name} забанен. Причина: {reason}"
-    elif cmd == "unban":
-        api("unbanChatMember", {"chat_id": chat_id, "user_id": uid, "only_if_banned": True})
-        text = f"✅ {name} разбанен."
-    elif cmd == "mute":
-        minutes = max(1, int(args[0])) if has_minutes else MUTE_DEFAULT_MIN
-        api("restrictChatMember", {
-            "chat_id": chat_id, "user_id": uid, "permissions": PERMS_NONE,
-            "until_date": int(time.time()) + minutes * 60,
-        })
-        record_action(chat_id, uid, name, "mute")
-        text = f"🔇 {name} в муте на {minutes} мин. Причина: {reason}"
-    elif cmd == "unmute":
-        api("restrictChatMember", {"chat_id": chat_id, "user_id": uid, "permissions": PERMS_ALL})
-        text = f"🔊 {name} снова может писать."
-    elif cmd == "warn":
-        key = (chat_id, uid)
-        warns[key] = warns.get(key, 0) + 1
-        record_action(chat_id, uid, name, "warn")
-        if warns[key] >= WARN_LIMIT:
-            api("banChatMember", {"chat_id": chat_id, "user_id": uid})
+def cmd_unban(msg, args, my):
+    target, _ = pick_target(msg, args, my)
+    if target and tg(msg, "unbanChatMember", {"chat_id": msg["chat"]["id"], "user_id": target["id"],
+                                             "only_if_banned": True}):
+        log_action(msg, target, "разбан")
+        reply(msg, f"✅ {name_of(target)} разбанен и может вернуться по ссылке.")
+
+
+def cmd_kick(msg, args, my):
+    chat_id = msg["chat"]["id"]
+    target, rest = pick_target(msg, args, my)
+    if not target:
+        return
+    reason = " ".join(rest) or "не указана"
+    # Кик = бан и сразу разбан: человек вылетает, но может вернуться
+    if not tg(msg, "banChatMember", {"chat_id": chat_id, "user_id": target["id"]}):
+        return
+    api("unbanChatMember", {"chat_id": chat_id, "user_id": target["id"], "only_if_banned": True})
+    members.get(chat_id, {}).pop(target["id"], None)
+    log_action(msg, target, "кик", reason)
+    reply(msg, f"👢 {name_of(target)} исключён из чата. Причина: {reason}")
+
+
+def cmd_mute(msg, args, my):
+    chat_id = msg["chat"]["id"]
+    target, rest = pick_target(msg, args, my)
+    if not target:
+        return
+    dur, rest = parse_duration(rest)
+    dur = dur or MUTE_DEFAULT_MIN * 60
+    reason = " ".join(rest) or "не указана"
+    if not tg(msg, "restrictChatMember", {"chat_id": chat_id, "user_id": target["id"], "permissions": PERMS_NONE,
+                                          "until_date": int(time.time()) + dur}):
+        return
+    record_action(chat_id, target["id"], name_of(target), "mute")
+    log_action(msg, target, f"мут на {fmt_duration(dur)}", reason)
+    reply(msg, f"🔇 {name_of(target)} в муте на {fmt_duration(dur)}. Причина: {reason}")
+
+
+def cmd_unmute(msg, args, my):
+    target, _ = pick_target(msg, args, my)
+    if target and tg(msg, "restrictChatMember", {"chat_id": msg["chat"]["id"], "user_id": target["id"],
+                                                 "permissions": PERMS_ALL}):
+        log_action(msg, target, "размут")
+        reply(msg, f"🔊 {name_of(target)} снова может писать.")
+
+
+def cmd_warn(msg, args, my):
+    chat_id = msg["chat"]["id"]
+    target, rest = pick_target(msg, args, my)
+    if not target:
+        return
+    reason = " ".join(rest) or "не указана"
+    key = (chat_id, target["id"])
+    warns[key] = warns.get(key, 0) + 1
+    record_action(chat_id, target["id"], name_of(target), "warn")
+    log_action(msg, target, "варн", reason)
+    if warns[key] >= WARN_LIMIT:
+        if tg(msg, "banChatMember", {"chat_id": chat_id, "user_id": target["id"]}):
             warns[key] = 0
-            record_action(chat_id, uid, name, "ban")
-            text = f"⚠️ {name}: {WARN_LIMIT} предупреждения, автобан. Причина: {reason}"
-        else:
-            text = f"⚠️ {name}, предупреждение {warns[key]} из {WARN_LIMIT}. Причина: {reason}"
-    elif cmd == "unwarn":
-        warns[(chat_id, uid)] = 0
-        text = f"Предупреждения {name} сняты."
-    else:
+            record_action(chat_id, target["id"], name_of(target), "ban")
+            members.get(chat_id, {}).pop(target["id"], None)
+            log_action(msg, target, "автобан", f"{WARN_LIMIT} варна")
+            reply(msg, f"⚠️ {name_of(target)}: {WARN_LIMIT} предупреждения, автобан. Причина: {reason}")
         return
-    send(chat_id, text, reply_to=target_msg["message_id"], with_button=False)
+    reply(msg, f"⚠️ {name_of(target)}, предупреждение {warns[key]} из {WARN_LIMIT}. Причина: {reason}")
+
+
+def cmd_unwarn(msg, args, my):
+    target, _ = pick_target(msg, args, my)
+    if target:
+        warns[(msg["chat"]["id"], target["id"])] = 0
+        log_action(msg, target, "снял варны")
+        reply(msg, f"Предупреждения {name_of(target)} сняты.")
+
+
+def cmd_warns(msg, args, my):
+    chat_id = msg["chat"]["id"]
+    target, _ = find_target(msg, args)
+    target = target or msg["from"]
+    n = warns.get((chat_id, target["id"]), 0)
+    last = [e for e in modlog.get(chat_id, []) if e["uid"] == target["id"] and e["act"] == "варн"][-n:] if n else []
+    text = f"⚠️ {name_of(target)}: предупреждений {n} из {WARN_LIMIT}."
+    if last:
+        text += "\n" + "\n".join(f"• {time.strftime('%d.%m', time.gmtime(e['t'] + 3 * 3600))} — {e['why']} ({e['by']})"
+                                 for e in last)
+    reply(msg, text)
+
+
+def cmd_del(msg, args, my):
+    target_msg = msg.get("reply_to_message")
+    if not target_msg:
+        reply(msg, "Ответь этой командой на сообщение, которое нужно удалить.")
+        return
+    if tg(msg, "deleteMessage", {"chat_id": msg["chat"]["id"], "message_id": target_msg["message_id"]}):
+        api("deleteMessage", {"chat_id": msg["chat"]["id"], "message_id": msg["message_id"]})
+
+
+def cmd_pin(msg, args, my):
+    target_msg = msg.get("reply_to_message")
+    if not target_msg:
+        reply(msg, "Ответь этой командой на сообщение, которое нужно закрепить.")
+        return
+    if tg(msg, "pinChatMessage", {"chat_id": msg["chat"]["id"], "message_id": target_msg["message_id"]}):
+        reply(msg, "📌 Закреплено.")
+
+
+def cmd_unpin(msg, args, my):
+    payload = {"chat_id": msg["chat"]["id"]}
+    if msg.get("reply_to_message"):
+        payload["message_id"] = msg["reply_to_message"]["message_id"]
+    if tg(msg, "unpinChatMessage", payload):
+        reply(msg, "Откреплено.")
+
+
+# ---------- Уровни (кто модератор, кто админ) ----------
+def cmd_promote(msg, args, my):
+    chat_id = msg["chat"]["id"]
+    target, rest = pick_target(msg, args, my)
+    if not target:
+        return
+    current = staff.get(chat_id, {}).get(target["id"], 0)
+    new = int(rest[0]) if rest and rest[0].isdigit() else current + 1
+    if not 1 <= new < my:
+        reply(msg, f"Можно выдать уровень от 1 до {my - 1}: " +
+              ", ".join(f"{k} — {LEVELS[k]}" for k in range(1, my)))
+        return
+    staff.setdefault(chat_id, {})[target["id"]] = new
+    remember(chat_id, target)
+    log_action(msg, target, f"уровень → {LEVELS[new]}")
+    reply(msg, f"{LEVEL_ICONS[new]} {name_of(target)} теперь {LEVELS[new]}.")
+
+
+def cmd_demote(msg, args, my):
+    chat_id = msg["chat"]["id"]
+    target, rest = pick_target(msg, args, my)
+    if not target:
+        return
+    current = staff.get(chat_id, {}).get(target["id"], 0)
+    new = int(rest[0]) if rest and rest[0].isdigit() else current - 1
+    new = max(0, min(new, current))
+    if new:
+        staff.setdefault(chat_id, {})[target["id"]] = new
+    else:
+        staff.get(chat_id, {}).pop(target["id"], None)
+    log_action(msg, target, f"уровень → {LEVELS[new]}")
+    text = f"{name_of(target)} теперь {LEVELS[new]}."
+    if get_level(chat_id, target["id"]) >= 2:
+        text += " Он остаётся админом Телеграма, поэтому в боте у него всё равно уровень Администратор."
+    reply(msg, text)
+
+
+def reply_staff(msg):
+    chat_id = msg["chat"]["id"]
+    people = {}  # id → (уровень, человек)
+    for m in get_admins(chat_id):
+        u = m["user"]
+        people[u["id"]] = (3 if m["status"] == "creator" else 2, u)
+    for uid, lvl in staff.get(chat_id, {}).items():
+        if uid not in people:
+            people[uid] = (lvl, members.get(chat_id, {}).get(uid, {"id": uid, "first_name": str(uid)}))
+    if not people:
+        reply(msg, "Пока нет ни модераторов, ни админов.")
+        return
+    lines = []
+    for lvl in (3, 2, 1):
+        group = [u for (l, u) in people.values() if l == lvl]
+        if group:
+            lines.append(f"\n{LEVEL_ICONS[lvl]} {LEVELS[lvl]}:")
+            lines += [f"  • {name_of(u)}" + (f" @{u['username']}" if u.get("username") else "") for u in group]
+    reply(msg, "Команда управления чатом:" + "\n".join(lines))
+
+
+# ---------- Должности в клубе ----------
+def cmd_setrole(msg, args, my):
+    chat_id = msg["chat"]["id"]
+    target, rest = pick_target(msg, args, my, check_level=False)
+    if not target:
+        return
+    role = " ".join(rest).strip()
+    if not role:
+        reply(msg, "Напиши должность: /setrole @ник Настройщик")
+        return
+    lst = roles.setdefault(chat_id, {}).setdefault(target["id"], [])
+    if role.lower() in (r.lower() for r in lst):
+        reply(msg, f"У {name_of(target)} уже есть должность «{role}».")
+        return
+    if len(lst) >= MAX_ROLES:
+        reply(msg, f"У одного человека может быть до {MAX_ROLES} должностей.")
+        return
+    lst.append(role)
+    remember(chat_id, target)
+    log_action(msg, target, f"должность + {role}")
+    reply(msg, f"🎖 {name_of(target)}: {', '.join(lst)}")
+
+
+def cmd_unrole(msg, args, my):
+    chat_id = msg["chat"]["id"]
+    target, rest = pick_target(msg, args, my, check_level=False)
+    if not target:
+        return
+    role = " ".join(rest).strip().lower()
+    lst = roles.get(chat_id, {}).get(target["id"], [])
+    left = [r for r in lst if role and r.lower() != role]
+    if left:
+        roles[chat_id][target["id"]] = left
+    else:
+        roles.get(chat_id, {}).pop(target["id"], None)
+    log_action(msg, target, f"должность − {role or 'все'}")
+    reply(msg, f"🎖 {name_of(target)}: {', '.join(left) or 'без должности'}")
+
+
+def reply_team(msg):
+    chat_id = msg["chat"]["id"]
+    table_roles = roles_by_username()
+    by_role = {}
+    for p in members.get(chat_id, {}).values():
+        own = roles.get(chat_id, {}).get(p["id"])
+        for r in own or [club_roles(chat_id, p, table_roles)]:
+            if r != "—":
+                by_role.setdefault(r, []).append(p)
+    if not by_role:
+        reply(msg, "Должностей пока нет. Админ может выдать: /setrole @ник Настройщик")
+        return
+    lines = []
+    for r in sorted(by_role, key=lambda r: (-len(by_role[r]), r)):
+        lines.append(f"\n🎖 {r} ({len(by_role[r])}):")
+        lines += [f"  • {name_of(p)}" + (f" @{p['username']}" if p.get("username") else "") for p in by_role[r]]
+    send_long(chat_id, "👥 Состав клуба по должностям", lines)
+
+
+# ---------- Правила, приветствие, жалобы, журнал ----------
+def reply_rules(msg):
+    text = settings.get(msg["chat"]["id"], {}).get("rules")
+    if text:
+        send(msg["chat"]["id"], "📜 Правила чата\n\n" + text, reply_to=msg["message_id"], group=True)
+    else:
+        send(msg["chat"]["id"], "📜 Правила клуба — во вкладке «Правила» в приложении.",
+             reply_to=msg["message_id"], group=True)
+
+
+def cmd_setrules(msg, args, my):
+    text = text_after_command(msg)
+    conf = settings.setdefault(msg["chat"]["id"], {})
+    if not text or text == "-":
+        conf.pop("rules", None)
+        reply(msg, "Свои правила убраны, /rules снова ведёт в приложение.")
+        return
+    conf["rules"] = text
+    log_action(msg, None, "обновил правила")
+    reply(msg, "📜 Правила сохранены. Посмотреть: /rules")
+
+
+def cmd_setwelcome(msg, args, my):
+    text = text_after_command(msg)
+    conf = settings.setdefault(msg["chat"]["id"], {})
+    if not text or text == "-":
+        conf.pop("welcome", None)
+        reply(msg, "Вернул стандартное приветствие.")
+        return
+    conf["welcome"] = text
+    reply(msg, "👋 Приветствие сохранено. Так его увидит новичок:\n\n" + text.replace("{name}", name_of(msg["from"])))
+
+
+def cmd_welcome(msg, args, my):
+    conf = settings.setdefault(msg["chat"]["id"], {})
+    if args and args[0].lower() in ("off", "выкл"):
+        conf["welcome_off"] = True
+        reply(msg, "Приветствие новичков выключено. Включить: /welcome on")
+    elif args and args[0].lower() in ("on", "вкл"):
+        conf.pop("welcome_off", None)
+        reply(msg, "Приветствие новичков включено.")
+    else:
+        state = "выключено" if conf.get("welcome_off") else "включено"
+        reply(msg, f"Приветствие сейчас {state}. /welcome on или /welcome off, текст — /setwelcome")
+
+
+def reply_report(msg):
+    chat_id = msg["chat"]["id"]
+    bad = msg.get("reply_to_message")
+    if not bad:
+        reply(msg, "Ответь /report на сообщение, на которое жалуешься.")
+        return
+    people = {m["user"]["id"]: m["user"] for m in get_admins(chat_id)}
+    for uid in staff.get(chat_id, {}):
+        people.setdefault(uid, members.get(chat_id, {}).get(uid, {"id": uid, "first_name": "модератор"}))
+    reason = text_after_command(msg) if msg.get("text", "").split(None, 1)[1:] else ""
+    head = f"🚩 Жалоба от {name_of(msg['from'])} на {name_of(bad.get('from'))}"
+    head += f": {reason}\n" if reason else "\n"
+    text, entities = with_mentions(head + "Модерация: ", list(people.values()), sep=", ")
+    send(chat_id, text.rstrip(","), reply_to=bad["message_id"], with_button=False, entities=entities)
+
+
+def cmd_modlog(msg, args, my):
+    lst = modlog.get(msg["chat"]["id"], [])[-10:]
+    if not lst:
+        reply(msg, "Журнал пуст.")
+        return
+    lines = [f"{time.strftime('%d.%m %H:%M', time.gmtime(e['t'] + 3 * 3600))} · {e['by']} → {e['act']}"
+             + (f" · {e['who']}" if e["who"] else "") + (f" ({e['why']})" if e.get("why") else "")
+             for e in reversed(lst)]
+    reply(msg, "📒 Последние действия модерации:\n" + "\n".join(lines))
 
 
 # ---------- Профиль пилота из таблицы ----------
@@ -411,11 +830,19 @@ def find_pilot(username):
 
 
 def reply_profile(msg):
-    parts = msg.get("text", "").split()
-    username = parts[1] if len(parts) > 1 else (msg.get("from") or {}).get("username", "")
-    username = username.lstrip("@")
+    chat_id = msg["chat"]["id"]
+    args = msg.get("text", "").split()[1:]
+    target, _ = find_target(msg, args)
+    if target:
+        username = target.get("username", "")
+    elif args and args[0].startswith("@"):
+        username = args[0][1:]
+    else:
+        target = msg.get("from") or {}
+        username = target.get("username", "")
+
     if not username:
-        text = "У тебя не задан username в Телеграме. Укажи его в настройках и повтори /profile."
+        text = "У этого участника не задан username в Телеграме, поэтому его нельзя найти в таблице."
     else:
         r = find_pilot(username)
         if r:
@@ -426,34 +853,110 @@ def reply_profile(msg):
                 f"Сдано заездов: {col(r, 3)}\n"
                 f"Побед (УТС): {col(r, 4)}\n"
                 f"Всего баллов: {col(r, 5)}\n"
-                f"Роль: {col(r, 6)}"
+                f"Роль в таблице: {col(r, 6)}"
             )
         else:
             text = f"@{username} пока нет в таблице. Попроси админа добавить тебя в «Статистику пилотов»."
-    send(msg["chat"]["id"], text, reply_to=msg["message_id"], with_button=False)
+
+    if target and msg["chat"]["type"] != "private":
+        lvl = get_level(chat_id, target["id"])
+        own = roles.get(chat_id, {}).get(target["id"], [])
+        text += f"\n\nВ чате: {LEVEL_ICONS.get(lvl, '')} {LEVELS[lvl]}".replace("  ", " ")
+        if own:
+            text += f"\nДолжности: {', '.join(own)}"
+        text += f"\nПредупреждений: {warns.get((chat_id, target['id']), 0)} из {WARN_LIMIT}"
+    reply(msg, text)
 
 
 HELP_TEXT = """📖 Команды бота
 
-Для всех:
+👥 Для всех:
 /help — это сообщение
-/all или слово «созвать» — отметить всех участников, которых бот знает
-/profile или /me — твоя карточка пилота из таблицы (можно /profile @ник)
-/top — топ-10 участников по сообщениям
-/roster — список участников: роль, сообщения за сегодня, неделю и всё время
-/stats или /mystats — статистика (ответом на сообщение — статистика того участника)
-/start или /app — кнопка с таблицами клуба
-@Khin_raci_bot — то же, что /app
+/all или слово «созвать» — отметить всех, кого знает бот
+/profile (/me) — карточка пилота, уровень и должности (ответом или /profile @ник — чужая)
+/stats — статистика сообщений (ответом — чужая)
+/top — топ-10 по сообщениям
+/roster — участники: должность, сообщения за день, неделю и всё время
+/team — состав клуба по должностям
+/staff — модераторы и админы
+/rules — правила чата
+/warns — свои предупреждения (ответом — чужие)
+/report причина — ответом на сообщение: позвать модерацию
+/app — кнопка с таблицами клуба
 
-Для админов группы (ответом на сообщение нарушителя):
-/ban причина — забанить
-/unban — разбанить
-/mute минуты причина — мут (по умолчанию 60 минут)
-/unmute — снять мут
+🛡 Модератор (уровень 1+):
 /warn причина — предупреждение, на {limit}-м бан
-/unwarn — сбросить предупреждения
+/unwarn — снять предупреждения
+/mute 30m причина — мут (30, 30m, 2h, 1d; по умолчанию {mute} мин.)
+/unmute — снять мут
+/kick причина — выгнать (сможет вернуться)
+/del — удалить сообщение
+/modlog — журнал последних действий
 
-В личке с ботом: /start и /profile.""".format(limit=WARN_LIMIT)
+⭐ Администратор (уровень 2+, все админы Телеграма):
+/ban 1d причина — бан, срок по желанию
+/unban — разбан
+/pin, /unpin — закрепить / открепить
+/promote [уровень] — повысить: 1 модератор, 2 администратор
+/demote [уровень] — понизить
+/setrole должность — выдать должность в клубе (можно несколько)
+/unrole [должность] — снять одну или все
+/setrules текст — свои правила для /rules
+/setwelcome текст — приветствие новичков ({{name}} — имя)
+/welcome on|off — включить или выключить приветствие
+
+Цель команды — ответ на сообщение, @ник или упоминание.
+Модерация понимает и слова без слэша: бан, мут, кик, варн, пред, разбан, размут, разварн.
+Владелец группы — уровень 3, может назначать администраторов.""".format(limit=WARN_LIMIT, mute=MUTE_DEFAULT_MIN)
+
+
+# ---------- Разбор команд ----------
+# Команда → минимальный уровень. Остальные команды доступны всем.
+ADMIN_CMDS = {
+    "warn": (1, cmd_warn), "unwarn": (1, cmd_unwarn), "warns": (0, cmd_warns),
+    "mute": (1, cmd_mute), "unmute": (1, cmd_unmute), "kick": (1, cmd_kick),
+    "del": (1, cmd_del), "modlog": (1, cmd_modlog),
+    "ban": (2, cmd_ban), "unban": (2, cmd_unban), "pin": (2, cmd_pin), "unpin": (2, cmd_unpin),
+    "promote": (2, cmd_promote), "demote": (2, cmd_demote),
+    "setrole": (2, cmd_setrole), "unrole": (2, cmd_unrole),
+    "setrules": (2, cmd_setrules), "setwelcome": (2, cmd_setwelcome), "welcome": (2, cmd_welcome),
+}
+SLASH_ALIASES = {"me": "profile", "mystats": "stats", "members": "roster", "roles": "team",
+                 "app": "start", "admins": "staff", "mods": "staff"}
+# Слова без слэша. Модерацию понимаем в начале любого сообщения (только от модераторов),
+# остальное — только если сообщение состоит из одного этого слова, чтобы бот не влезал в разговор.
+MOD_WORDS = {"бан": "ban", "разбан": "unban", "кик": "kick", "мут": "mute", "размут": "unmute",
+             "варн": "warn", "пред": "warn", "разварн": "unwarn"}
+SOLO_WORDS = {"варны": "warns", "правила": "rules", "профиль": "profile", "админы": "staff",
+              "должности": "team", "журнал": "modlog", "репорт": "report"}
+
+
+def parse_command(text):
+    # Возвращает (команда, аргументы, написана ли словом без слэша)
+    parts = text.split()
+    if not parts:
+        return None, [], False
+    first = parts[0].lower()
+    if first[0] in "/!":
+        name, _, bot = first[1:].partition("@")
+        if bot and bot != BOT_USERNAME:
+            return None, [], False  # команда другому боту
+        return SLASH_ALIASES.get(name, name), parts[1:], False
+    if first in MOD_WORDS:
+        return MOD_WORDS[first], parts[1:], True
+    if first in SOLO_WORDS and len(parts) == 1:
+        return SOLO_WORDS[first], [], True
+    return None, [], False
+
+
+def run_admin(msg, cmd, args, is_word):
+    need, handler = ADMIN_CMDS[cmd]
+    my = get_level(msg["chat"]["id"], msg["from"]["id"]) if need else 0
+    if my < need:
+        if not is_word:  # на слова от обычных участников молчим: это просто разговор
+            reply(msg, f"Нужен уровень «{LEVELS[need]}» или выше. Кто есть кто — /staff")
+        return
+    handler(msg, args, my)
 
 
 # ---------- Основная обработка ----------
@@ -465,6 +968,7 @@ def handle(msg):
     # Участники: вошедшие и вышедшие
     for u in msg.get("new_chat_members", []):
         remember(chat_id, u)
+        welcome(chat_id, u)
     if "left_chat_member" in msg:
         members.get(chat_id, {}).pop(msg["left_chat_member"]["id"], None)
     service = "new_chat_members" in msg or "left_chat_member" in msg
@@ -479,44 +983,46 @@ def handle(msg):
                 remember(chat_id, ent.get("user"))
 
     text = msg.get("text", "")
-    if not text:
+    if not text or "from" not in msg:
         return
     lower = text.lower()
-    words = lower.split()
-    first = words[0].split("@")[0] if words else ""
-    args = text.split()[1:]
+    cmd, args, is_word = parse_command(text)
 
-    if first in ("/roster", "/members"):
+    if cmd in ADMIN_CMDS:
         if is_group:
-            reply_roster(msg)
+            run_admin(msg, cmd, args, is_word)
         return
-    if first == "/help":
-        send(chat_id, HELP_TEXT, reply_to=msg["message_id"], with_button=False)
+    if cmd == "help":
+        reply(msg, HELP_TEXT)
         return
-    if first in ("/profile", "/me"):
+    if cmd == "profile":
         reply_profile(msg)
         return
-    if first == "/top":
+    if cmd == "top":
         reply_top(msg)
         return
-    if first in ("/stats", "/mystats"):
+    if cmd == "stats":
         reply_mystats(msg)
         return
 
-    if chat["type"] == "private":
-        if first == "/start":
+    if not is_group:
+        if cmd == "start":
             send(chat_id, "Привет! Нажми кнопку ниже, чтобы открыть таблицы клуба.")
         return
 
-    if first in MOD_CMDS:
-        moderate(msg, first[1:], args)
-        return
-
-    if lower.startswith("/all") or "созвать" in lower:
+    if cmd == "roster":
+        reply_roster(msg)
+    elif cmd == "team":
+        reply_team(msg)
+    elif cmd == "staff":
+        reply_staff(msg)
+    elif cmd == "rules":
+        reply_rules(msg)
+    elif cmd == "report":
+        reply_report(msg)
+    elif cmd == "all" or "созвать" in lower:
         call_everyone(msg)
-        return
-
-    if first in ("/start", "/app") or f"@{BOT_USERNAME}" in lower:
+    elif cmd == "start" or f"@{BOT_USERNAME}" in lower:
         send(chat_id, "Таблицы клуба: правила, расписание, пилоты и сводка.",
              reply_to=msg["message_id"], group=True)
 
@@ -532,7 +1038,7 @@ class Handler(BaseHTTPRequestHandler):
             elif "message" in update:
                 handle(update["message"])
         except Exception as e:
-            print("Ошибка:", e)
+            print("Ошибка:", repr(e))
         save_state()
         self.send_response(200)
         self.end_headers()
@@ -545,6 +1051,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+PUBLIC_MENU = [
+    ("help", "Все команды"), ("all", "Отметить всех"), ("profile", "Карточка пилота"),
+    ("stats", "Статистика сообщений"), ("top", "Топ по сообщениям"), ("roster", "Участники"),
+    ("team", "Состав по должностям"), ("staff", "Модераторы и админы"), ("rules", "Правила чата"),
+    ("warns", "Предупреждения"), ("report", "Позвать модерацию (ответом)"), ("app", "Таблицы клуба"),
+]
+ADMIN_MENU = PUBLIC_MENU + [
+    ("warn", "Предупреждение"), ("mute", "Мут: /mute 30m причина"), ("unmute", "Снять мут"),
+    ("kick", "Выгнать"), ("ban", "Бан: /ban 1d причина"), ("unban", "Разбан"), ("unwarn", "Снять варны"),
+    ("del", "Удалить сообщение"), ("pin", "Закрепить"), ("unpin", "Открепить"),
+    ("promote", "Повысить уровень"), ("demote", "Понизить уровень"),
+    ("setrole", "Выдать должность"), ("unrole", "Снять должность"),
+    ("setrules", "Задать правила"), ("setwelcome", "Задать приветствие"),
+    ("welcome", "Приветствие вкл/выкл"), ("modlog", "Журнал модерации"),
+]
 
 
 def setup_webhook():
@@ -561,6 +1084,10 @@ def setup_webhook():
     if me and not me.get("can_read_all_group_messages"):
         print("Внимание: у бота включена приватность. Если он не админ группы, он не видит обычные "
               "сообщения и не запоминает участников. BotFather → /setprivacy → Disable или сделай бота админом.")
+    # Меню команд при вводе «/»: участникам — общие, админам — ещё и модерация
+    as_cmds = lambda menu: [{"command": c, "description": d} for c, d in menu]
+    api("setMyCommands", {"commands": as_cmds(PUBLIC_MENU)})
+    api("setMyCommands", {"commands": as_cmds(ADMIN_MENU), "scope": {"type": "all_chat_administrators"}})
     print("База данных:", "подключена" if DB_OK else "НЕ подключена, смотри ошибку выше")
 
 
@@ -568,4 +1095,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     setup_webhook()
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
-
