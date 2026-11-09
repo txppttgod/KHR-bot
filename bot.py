@@ -1,10 +1,14 @@
 import os
+import sys
 import json
 import csv
 import io
 import time
 import requests
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# Без этого Python на Render копит print() в буфере, и в Logs ничего не видно
+sys.stdout.reconfigure(line_buffering=True)
 
 TOKEN = os.environ["BOT_TOKEN"]
 APP_URL = os.environ.get("APP_URL", "https://txppttgod.github.io/index.html/club_app.html")
