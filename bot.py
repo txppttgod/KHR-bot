@@ -959,28 +959,45 @@ def tg_file(file_id):
         return None
 
 
+def thinking_config(model):
+    # Новые модели по умолчанию долго «думают» (до минуты на скрин). Чтобы прочитать таблицу, это не нужно.
+    v = re.search(r"gemini-(\d+(?:\.\d+)?)", model)
+    if v and float(v.group(1)) < 3:
+        return {"thinkingBudget": 0}
+    return {"thinkingLevel": "low"}
+
+
 def gemini_read(image, mime):
-    body = {
-        "contents": [{"parts": [
-            {"text": DUEL_PROMPT},
-            {"inline_data": {"mime_type": mime, "data": base64.b64encode(image).decode()}},
-        ]}],
-        "generationConfig": {"temperature": 0, "responseMimeType": "application/json",
-                             "responseSchema": DUEL_SCHEMA},
-    }
+    contents = [{"parts": [
+        {"text": DUEL_PROMPT},
+        {"inline_data": {"mime_type": mime, "data": base64.b64encode(image).decode()}},
+    ]}]
     last = 0
     for model in gemini_models()[:3]:
-        for attempt in range(2):
+        think, retried = thinking_config(model), False
+        for _ in range(3):
+            cfg = {"temperature": 0, "responseMimeType": "application/json", "responseSchema": DUEL_SCHEMA}
+            if think:
+                cfg["thinkingConfig"] = think
+            started = time.time()
             try:
                 r = requests.post(f"{GEMINI_API}/models/{model}:generateContent",
-                                  headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=45)
+                                  headers={"x-goog-api-key": GEMINI_KEY},
+                                  json={"contents": contents, "generationConfig": cfg}, timeout=75)
             except Exception as e:
                 print(f"Gemini {model}: нет ответа ({e.__class__.__name__}), пробую следующую")
                 r = None
                 break
-            if r.status_code in (429, 500, 503) and attempt == 0:
+            if r.status_code == 400 and think:
+                print(f"Gemini {model}: не принял настройку размышлений, повторяю без неё")
+                think = None
+                continue
+            if r.status_code in (429, 500, 503) and not retried:
+                retried = True
                 time.sleep(8 if r.status_code == 429 else 3)  # лимит бесплатного ключа или перегрузка
                 continue
+            if r.status_code < 300:
+                print(f"Gemini {model}: ответ за {time.time() - started:.0f} с")
             break
         if r is None:
             last = 503
