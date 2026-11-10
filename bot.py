@@ -9,7 +9,8 @@ import base64
 import datetime
 import threading
 import requests
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import queue
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Без этого Python на Render копит print() в буфере, и в Logs ничего не видно
 sys.stdout.reconfigure(line_buffering=True)
@@ -913,6 +914,9 @@ _albums = {}       # (чат, media_group_id) → сводка по альбом
 _seen_msgs = set() # уже обработанные скрины (если Телеграм пришлёт обновление повторно)
 _sheet = {"timer": None}
 _models = {"time": 0, "list": []}
+LOCK = threading.RLock()     # база и память бота: меняет только один поток за раз
+DUEL_QUEUE = queue.Queue()   # скрины ждут, пока их прочитает ИИ
+DUEL_ASYNC = False           # при запуске на сервере включается; в тестах скрины читаются сразу
 
 
 def msk_today():
@@ -965,11 +969,11 @@ def gemini_read(image, mime):
                              "responseSchema": DUEL_SCHEMA},
     }
     last = 0
-    for model in gemini_models()[:4]:
+    for model in gemini_models()[:3]:
         for attempt in range(2):
             try:
                 r = requests.post(f"{GEMINI_API}/models/{model}:generateContent",
-                                  headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=90)
+                                  headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=60)
             except Exception as e:
                 print("Ошибка связи с Gemini:", e)
                 return None, "нет связи с ИИ"
@@ -1096,10 +1100,44 @@ def duel_report_text(chat_id, user, s):
 
 
 def handle_duel_report(msg):
-    chat_id, user = msg["chat"]["id"], msg["from"]
-    if (chat_id, msg["message_id"]) in _seen_msgs:
+    # ИИ читает скрин долго (до минуты). Если делать это прямо в обработчике, бот не отвечает,
+    # Render считает его зависшим и перезапускает. Поэтому скрины читает отдельный поток по очереди.
+    key = (msg["chat"]["id"], msg["message_id"])
+    if key in _seen_msgs:
         return
-    _seen_msgs.add((chat_id, msg["message_id"]))
+    _seen_msgs.add(key)
+    if DUEL_ASYNC:
+        DUEL_QUEUE.put(msg)
+    else:
+        apply_duel(msg, *read_duel(msg))
+
+
+def duel_worker():
+    while True:
+        msg = DUEL_QUEUE.get()
+        try:
+            res, err = read_duel(msg)  # без блокировки: остальные сообщения бот обрабатывает в это время
+            with LOCK:
+                load_state()
+                apply_duel(msg, res, err)
+                save_state()
+        except Exception as e:
+            print("Ошибка обработки скрина:", repr(e))
+
+
+def read_duel(msg):
+    if not GEMINI_KEY:
+        print("Не задан GEMINI_API_KEY")
+        return None, "не задан GEMINI_API_KEY в Render, скрины не читаются"
+    file_id, mime = duel_image(msg)
+    image = tg_file(file_id)
+    if not image:
+        return None, "не удалось скачать скрин из Телеграма"
+    return gemini_read(image, mime)
+
+
+def apply_duel(msg, res, err):
+    chat_id, user = msg["chat"]["id"], msg["from"]
     group = msg.get("media_group_id") or str(msg["message_id"])
     key = (chat_id, group)
     s = _albums.get(key)
@@ -1109,26 +1147,17 @@ def handle_duel_report(msg):
     for k in [k for k, v in _albums.items() if time.time() - v["t"] > 3600]:
         del _albums[k]
 
-    if not GEMINI_KEY:
-        err = "не задан GEMINI_API_KEY в Render, скрины не читаются"
-        print(err)
+    if err:
         if err not in s["errors"]:
             s["errors"].append(err)
+    elif not res.get("is_duel_history") or not res.get("rows"):
+        s["bad"] += 1
     else:
-        file_id, mime = duel_image(msg)
-        image = tg_file(file_id)
-        res, err = gemini_read(image, mime) if image else (None, "не удалось скачать скрин из Телеграма")
-        if err:
-            if err not in s["errors"]:
-                s["errors"].append(err)
-        elif not res.get("is_duel_history") or not res.get("rows"):
-            s["bad"] += 1
-        else:
-            a, d, k = add_duels(chat_id, user["id"], res.get("opponent"), res["rows"], group)
-            s["added"] += a
-            s["dup"] += d
-            s["skip"] += k
-            print(f"Дуэли {name_of(user)}: {res.get('opponent')} +{a}, повторов {d}, вне срока {k}")
+        a, d, k = add_duels(chat_id, user["id"], res.get("opponent"), res["rows"], group)
+        s["added"] += a
+        s["dup"] += d
+        s["skip"] += k
+        print(f"Дуэли {name_of(user)}: {res.get('opponent')} +{a}, повторов {d}, вне срока {k}")
 
     text = duel_report_text(chat_id, user, s)
     markup = {"inline_keyboard": [[{"text": "❌ Отменить этот отчёт", "callback_data": f"du:{user['id']}:{group}"}]]}
@@ -1493,21 +1522,24 @@ def handle(msg):
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        try:
-            update = json.loads(self.rfile.read(length) or b"{}")
-            load_state()
-            if "chat_member" in update:
-                handle_chat_member(update["chat_member"])
-            elif "message" in update:
-                handle(update["message"])
-            elif "callback_query" in update:
-                handle_callback(update["callback_query"])
-        except Exception as e:
-            print("Ошибка:", repr(e))
-        save_state()
+        body = self.rfile.read(length)
+        # Сразу отвечаем Телеграму, чтобы он не слал то же сообщение повторно
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"ok")
+        with LOCK:  # сообщения обрабатываем по одному, чтобы не затереть базу
+            try:
+                update = json.loads(body or b"{}")
+                load_state()
+                if "chat_member" in update:
+                    handle_chat_member(update["chat_member"])
+                elif "message" in update:
+                    handle(update["message"])
+                elif "callback_query" in update:
+                    handle_callback(update["callback_query"])
+            except Exception as e:
+                print("Ошибка:", repr(e))
+            save_state()
 
     def do_GET(self):
         self.send_response(200)
@@ -1562,4 +1594,6 @@ def setup_webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     setup_webhook()
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    DUEL_ASYNC = True
+    threading.Thread(target=duel_worker, daemon=True).start()
+    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
