@@ -5,6 +5,9 @@ import csv
 import io
 import re
 import time
+import base64
+import datetime
+import threading
 import requests
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -22,12 +25,17 @@ PILOTS_CSV = os.environ.get(
 SB_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SB_KEY = os.environ.get("SUPABASE_KEY", "")
 API = f"https://api.telegram.org/bot{TOKEN}"
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODELS = [m for m in (os.environ.get("GEMINI_MODEL", ""), "gemini-2.5-flash", "gemini-flash-latest") if m]
+SHEET_HOOK = os.environ.get("SHEET_HOOK", "")  # адрес Apps Script для выгрузки дуэлей в Google-таблицу
 
 CHUNK = 20              # сколько участников тегать в одном сообщении
 WARN_LIMIT = 3          # сколько предупреждений до автобана
 MUTE_DEFAULT_MIN = 60   # мут по умолчанию, в минутах
 MODLOG_SIZE = 50        # сколько последних действий модерации хранить на чат
 MAX_ROLES = 5           # сколько должностей можно дать одному человеку
+DUEL_NORM_DEFAULT = 20  # норма дуэлей в неделю, меняется командой /setnorm
+DUEL_KEEP_DAYS = 70     # сколько дней хранить дуэли
 PERM_KEYS = [
     "can_send_messages", "can_send_audios", "can_send_documents", "can_send_photos",
     "can_send_videos", "can_send_video_notes", "can_send_voice_notes", "can_send_polls",
@@ -99,7 +107,7 @@ def load_state():
     # Читаем базу перед каждым сообщением. Раньше она читалась один раз при запуске,
     # и если в этот момент Supabase не ответил, бот до перезапуска ничего не сохранял.
     # Так же не теряются данные, когда Render при деплое ненадолго держит две копии бота.
-    global DB_OK, members, stats, warns, staff, roles, settings, modlog
+    global DB_OK, members, stats, warns, staff, roles, settings, modlog, duels
     ok, d = db_load()
     DB_OK = ok
     if not ok:
@@ -110,6 +118,7 @@ def load_state():
     roles = int_keys(d.get("roles", {}))        # чат → {человек: [должности]}
     settings = int_keys(d.get("settings", {}), 1)  # чат → {rules, welcome, welcome_off}
     modlog = int_keys(d.get("modlog", {}), 1)      # чат → [последние действия]
+    duels = int_keys(d.get("duels", {}))        # чат → {человек: [дуэли]}
     warns = {}
     for k, n in d.get("warns", {}).items():
         c, u = k.split("_")
@@ -126,11 +135,12 @@ def save_state():
         "roles": str_keys(roles),
         "settings": str_keys(settings, 1),
         "modlog": str_keys(modlog, 1),
+        "duels": str_keys(duels),
         "warns": {f"{c}_{u}": n for (c, u), n in warns.items()},
     })
 
 
-members, stats, warns, staff, roles, settings, modlog = {}, {}, {}, {}, {}, {}, {}
+members, stats, warns, staff, roles, settings, modlog, duels = {}, {}, {}, {}, {}, {}, {}, {}
 load_state()
 _cache = {"time": 0, "rows": []}
 
@@ -868,6 +878,397 @@ def reply_profile(msg):
     reply(msg, text)
 
 
+# ---------- Учёт дуэлей по скриншотам ----------
+# Участники кидают в тему отчётов скриншоты «ИСТОРИЯ ЗАЕЗДОВ vs соперник». ИИ (Gemini) читает
+# каждую строку: дата, результат, счёт. Бот засчитывает каждую дуэль один раз (повторы со старых
+# скринов отбрасываются) и считает, сколько дуэлей за текущую неделю (пн–вс по Москве).
+DUEL_PROMPT = (
+    "Это скриншот из игры CarX Drift Racing 3. Нужный экран называется «ИСТОРИЯ ЗАЕЗДОВ» "
+    "(история парных дуэлей против одного соперника); вверху написано «vs <ник соперника>». "
+    "Каждая строка таблицы — одна дуэль: конфигурация трассы, дата в формате Д/М/ГГ "
+    "(сначала день, потом месяц, потом год), результат «Победа», «Поражение» или «Ничья» "
+    "и в скобках два числа очков, например «Поражение (176.9 / 178.8)».\n"
+    "Верни JSON. is_duel_history — true только если это именно такой экран. opponent — ник соперника "
+    "из «vs ...» ровно как написано. rows — все строки, которые видны целиком: date в формате ГГГГ-ММ-ДД, "
+    "result: win, loss или draw, score — два числа через « / » как на экране, track — конфигурация. "
+    "Не придумывай строки, которых не видно, и не пропускай видимые."
+)
+DUEL_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "is_duel_history": {"type": "BOOLEAN"},
+        "opponent": {"type": "STRING"},
+        "rows": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+            "date": {"type": "STRING"},
+            "result": {"type": "STRING", "enum": ["win", "loss", "draw"]},
+            "score": {"type": "STRING"},
+            "track": {"type": "STRING"},
+        }, "required": ["date", "result", "score"]}},
+    },
+    "required": ["is_duel_history", "rows"],
+}
+RESULT_RU = {"win": "Победа", "loss": "Поражение", "draw": "Ничья"}
+_albums = {}       # (чат, media_group_id) → сводка по альбому, чтобы отвечать одним сообщением
+_seen_msgs = set() # уже обработанные скрины (если Телеграм пришлёт обновление повторно)
+_sheet = {"timer": None}
+
+
+def msk_today():
+    return (datetime.datetime.utcnow() + datetime.timedelta(hours=3)).date()
+
+
+def week_bounds(day=None, back=0):
+    day = day or msk_today()
+    start = day - datetime.timedelta(days=day.weekday() + 7 * back)
+    return start, start + datetime.timedelta(days=6)
+
+
+def week_label(start, end):
+    return f"{start:%d.%m}–{end:%d.%m}"
+
+
+def get_norm(chat_id):
+    return settings.get(chat_id, {}).get("norm", DUEL_NORM_DEFAULT)
+
+
+def duels_in(chat_id, uid, start, end):
+    a, b = start.isoformat(), end.isoformat()
+    return sum(1 for d in duels.get(chat_id, {}).get(uid, []) if a <= d["d"] <= b)
+
+
+def norm_score(s):
+    nums = re.findall(r"\d+(?:[.,]\d+)?", s or "")
+    return " / ".join(n.replace(",", ".") for n in nums[:2])
+
+
+def tg_file(file_id):
+    path = api("getFile", {"file_id": file_id}).get("result", {}).get("file_path")
+    if not path:
+        return None
+    try:
+        r = requests.get(f"https://api.telegram.org/file/bot{TOKEN}/{path}", timeout=30)
+        return r.content if r.status_code == 200 else None
+    except Exception as e:
+        print("Ошибка скачивания скрина:", e)
+        return None
+
+
+def gemini_read(image, mime):
+    body = {
+        "contents": [{"parts": [
+            {"text": DUEL_PROMPT},
+            {"inline_data": {"mime_type": mime, "data": base64.b64encode(image).decode()}},
+        ]}],
+        "generationConfig": {"temperature": 0, "responseMimeType": "application/json",
+                             "responseSchema": DUEL_SCHEMA},
+    }
+    for model in GEMINI_MODELS:
+        for attempt in range(2):
+            try:
+                r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                                  headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=90)
+            except Exception as e:
+                print("Ошибка связи с Gemini:", e)
+                return None, "нет связи с ИИ"
+            if r.status_code == 429 and attempt == 0:
+                time.sleep(8)  # бесплатный ключ: несколько запросов в минуту
+                continue
+            break
+        if r.status_code == 404:
+            print(f"Модель {model} не найдена, пробую следующую")
+            continue
+        if r.status_code == 429:
+            return None, "ИИ перегружен (лимит бесплатного ключа), перешли этот скрин чуть позже"
+        if r.status_code >= 300:
+            print(f"Ошибка Gemini: HTTP {r.status_code} {r.text[:300]}")
+            return None, f"ошибка ИИ (HTTP {r.status_code})"
+        try:
+            parts = r.json()["candidates"][0]["content"]["parts"]
+            return json.loads("".join(p.get("text", "") for p in parts if not p.get("thought"))), ""
+        except Exception as e:
+            print("Непонятный ответ Gemini:", e, r.text[:300])
+            return None, "ИИ вернул непонятный ответ"
+    return None, "модель ИИ не найдена, проверь GEMINI_MODEL в Render"
+
+
+def duel_image(msg):
+    # Скрин фото или файлом (без сжатия). Возвращает (file_id, mime) или (None, None)
+    if msg.get("photo"):
+        return msg["photo"][-1]["file_id"], "image/jpeg"
+    doc = msg.get("document") or {}
+    if doc.get("mime_type", "").startswith("image/") and doc.get("file_size", 0) < 15_000_000:
+        return doc["file_id"], doc["mime_type"]
+    return None, None
+
+
+def is_duel_report(msg):
+    conf = settings.get(msg["chat"]["id"], {})
+    if "duel_thread" not in conf or (msg.get("from") or {}).get("is_bot"):
+        return False
+    return msg.get("message_thread_id", 0) == conf["duel_thread"] and duel_image(msg)[0] is not None
+
+
+def add_duels(chat_id, uid, opponent, rows, group):
+    # Возвращает (новых, повторов, вне срока)
+    mine = duels.setdefault(chat_id, {}).setdefault(uid, [])
+    have = {(d["d"], d["o"].lower(), d["s"]) for d in mine}
+    today = msk_today()
+    oldest = today - datetime.timedelta(days=DUEL_KEEP_DAYS)
+    added = dup = skip = 0
+    opp = re.sub(r"^\s*vs\.?\s*", "", opponent or "", flags=re.I).strip() or "?"
+    for row in rows:
+        try:
+            day = datetime.date.fromisoformat(str(row.get("date", "")).strip())
+        except ValueError:
+            skip += 1
+            continue
+        if day > today + datetime.timedelta(days=1) or day < oldest:
+            skip += 1
+            continue
+        key = (day.isoformat(), opp.lower(), norm_score(row.get("score")))
+        if key in have:
+            dup += 1
+            continue
+        have.add(key)
+        mine.append({"d": key[0], "o": opp, "r": row.get("result", ""), "s": key[2],
+                     "t": (row.get("track") or "")[:40], "g": group})
+        added += 1
+    mine.sort(key=lambda d: d["d"])
+    return added, dup, skip
+
+
+def prune_duels():
+    cutoff = (msk_today() - datetime.timedelta(days=DUEL_KEEP_DAYS)).isoformat()
+    for chat in duels.values():
+        for uid in list(chat):
+            chat[uid] = [d for d in chat[uid] if d["d"] >= cutoff]
+
+
+def duel_report_text(chat_id, user, s):
+    start, end = week_bounds()
+    week, norm = duels_in(chat_id, user["id"], start, end), get_norm(chat_id)
+    who = name_of(user) + (f" (@{user['username']})" if user.get("username") else "")
+    lines = [f"📸 Отчёт по дуэлям: {who}", f"Засчитано новых дуэлей: {s['added']}"]
+    extra = []
+    if s["dup"]:
+        extra.append(f"повторы (уже были): {s['dup']}")
+    if s["skip"]:
+        extra.append(f"вне срока или без даты: {s['skip']}")
+    if extra:
+        lines.append(" · ".join(extra).capitalize())
+    if s["bad"]:
+        lines.append(f"Не похоже на «Историю заездов»: {s['bad']} скрин.")
+    for e in s["errors"]:
+        lines.append("⚠️ " + e)
+    status = "✅ норма выполнена" if week >= norm else f"осталось {norm - week}"
+    lines.append(f"\nЗа неделю {week_label(start, end)}: {week} из {norm} — {status}")
+    if s.get("undone"):
+        lines.append("\n❌ " + s["undone"])
+    return "\n".join(lines)
+
+
+def handle_duel_report(msg):
+    chat_id, user = msg["chat"]["id"], msg["from"]
+    if (chat_id, msg["message_id"]) in _seen_msgs:
+        return
+    _seen_msgs.add((chat_id, msg["message_id"]))
+    group = msg.get("media_group_id") or str(msg["message_id"])
+    key = (chat_id, group)
+    s = _albums.get(key)
+    if not s:
+        s = _albums[key] = {"added": 0, "dup": 0, "skip": 0, "bad": 0, "errors": [], "reply": None,
+                            "uid": user["id"], "t": time.time()}
+    for k in [k for k, v in _albums.items() if time.time() - v["t"] > 3600]:
+        del _albums[k]
+
+    if not GEMINI_KEY:
+        err = "не задан GEMINI_API_KEY в Render, скрины не читаются"
+        print(err)
+        if err not in s["errors"]:
+            s["errors"].append(err)
+    else:
+        file_id, mime = duel_image(msg)
+        image = tg_file(file_id)
+        res, err = gemini_read(image, mime) if image else (None, "не удалось скачать скрин из Телеграма")
+        if err:
+            if err not in s["errors"]:
+                s["errors"].append(err)
+        elif not res.get("is_duel_history") or not res.get("rows"):
+            s["bad"] += 1
+        else:
+            a, d, k = add_duels(chat_id, user["id"], res.get("opponent"), res["rows"], group)
+            s["added"] += a
+            s["dup"] += d
+            s["skip"] += k
+            print(f"Дуэли {name_of(user)}: {res.get('opponent')} +{a}, повторов {d}, вне срока {k}")
+
+    text = duel_report_text(chat_id, user, s)
+    markup = {"inline_keyboard": [[{"text": "❌ Отменить этот отчёт", "callback_data": f"du:{user['id']}:{group}"}]]}
+    if s["added"] == 0:
+        markup = {"inline_keyboard": []}
+    if s["reply"]:
+        api("editMessageText", {"chat_id": chat_id, "message_id": s["reply"], "text": text, "reply_markup": markup})
+    else:
+        payload = {"chat_id": chat_id, "text": text, "reply_markup": markup,
+                   "reply_parameters": {"message_id": msg["message_id"], "allow_sending_without_reply": True}}
+        if msg.get("message_thread_id"):
+            payload["message_thread_id"] = msg["message_thread_id"]
+        s["reply"] = api("sendMessage", payload).get("result", {}).get("message_id")
+    prune_duels()
+    schedule_sheet_sync(chat_id)
+
+
+def handle_callback(cq):
+    data = cq.get("data", "")
+    msg = cq.get("message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    if not data.startswith("du:") or not chat_id:
+        api("answerCallbackQuery", {"callback_query_id": cq["id"]})
+        return
+    _, uid, group = data.split(":", 2)
+    uid = int(uid)
+    clicker = cq["from"]
+    if clicker["id"] != uid and get_level(chat_id, clicker["id"]) < 1:
+        api("answerCallbackQuery", {"callback_query_id": cq["id"], "show_alert": True,
+                                    "text": "Отменить отчёт может только его автор или модератор."})
+        return
+    mine = duels.get(chat_id, {}).get(uid, [])
+    removed = sum(1 for d in mine if d.get("g") == group)
+    if uid in duels.get(chat_id, {}):
+        duels[chat_id][uid] = [d for d in mine if d.get("g") != group]
+    start, end = week_bounds()
+    week = duels_in(chat_id, uid, start, end)
+    text = (msg.get("text", "") + f"\n\n❌ Отменено ({name_of(clicker)}): снято дуэлей {removed}. "
+            f"Теперь за неделю: {week} из {get_norm(chat_id)}")
+    api("editMessageText", {"chat_id": chat_id, "message_id": msg["message_id"], "text": text,
+                            "reply_markup": {"inline_keyboard": []}})
+    api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": f"Снято дуэлей: {removed}"})
+    log_action({"chat": {"id": chat_id}, "from": clicker}, members.get(chat_id, {}).get(uid, {"id": uid}),
+               f"отменил отчёт по дуэлям (−{removed})")
+    schedule_sheet_sync(chat_id)
+
+
+def duel_people(chat_id):
+    # Все, кого показывать в норме: пилоты из таблицы (по @нику) и все, кто сдавал отчёты
+    by_name = {(u.get("username") or "").lower(): u for u in members.get(chat_id, {}).values() if u.get("username")}
+    people, seen = [], set()
+    for r in get_pilots():
+        tgname = col(r, 2).lower().lstrip("@")
+        u = by_name.get(tgname) if tgname != "—" else None
+        people.append({"name": col(r, 1), "tg": "" if tgname == "—" else tgname, "uid": u["id"] if u else None})
+        if u:
+            seen.add(u["id"])
+    for uid in duels.get(chat_id, {}):
+        if uid not in seen and duels[chat_id][uid]:
+            u = members.get(chat_id, {}).get(uid, {})
+            people.append({"name": u.get("first_name", str(uid)), "tg": u.get("username", ""), "uid": uid})
+    return people
+
+
+def reply_norm(msg, args):
+    chat_id = msg["chat"]["id"]
+    norm = get_norm(chat_id)
+    start, end = week_bounds()
+    pstart, pend = week_bounds(back=1)
+    if args and args[0].lower() in ("all", "все", "всех"):
+        rows = []
+        for p in duel_people(chat_id):
+            n = duels_in(chat_id, p["uid"], start, end) if p["uid"] else 0
+            rows.append((n, p))
+        rows.sort(key=lambda x: -x[0])
+        done = sum(1 for n, _ in rows if n >= norm)
+        head = (f"🏁 Норма дуэлей за неделю {week_label(start, end)}: {norm}\n"
+                f"Выполнили: {done} из {len(rows)}\n")
+        lines = [f"{'✅' if n >= norm else '⏳'} {p['name']}{' @' + p['tg'] if p['tg'] else ''} — {n}/{norm}"
+                 + ("" if p["uid"] else " (бот не знает @ника в чате)") for n, p in rows]
+        send_long(chat_id, head, lines)
+        return
+    target, _ = find_target(msg, args)
+    target = target or msg["from"]
+    uid = target["id"]
+    week, prev = duels_in(chat_id, uid, start, end), duels_in(chat_id, uid, pstart, pend)
+    status = "✅ выполнена" if week >= norm else f"осталось {norm - week}"
+    recent = [d for d in duels.get(chat_id, {}).get(uid, []) if d["d"] >= start.isoformat()][-10:]
+    text = (f"🏁 Дуэли: {name_of(target)}\n"
+            f"Эта неделя {week_label(start, end)}: {week} из {norm} — {status}\n"
+            f"Прошлая неделя {week_label(pstart, pend)}: {prev} из {norm}")
+    if recent:
+        text += "\n\nПоследние за неделю:\n" + "\n".join(
+            f"{datetime.date.fromisoformat(d['d']):%d.%m} vs {d['o']} — {RESULT_RU.get(d['r'], d['r'])} ({d['s']})"
+            for d in recent)
+    reply(msg, text)
+
+
+def cmd_setnorm(msg, args, my):
+    if not args or not args[0].isdigit() or not 0 < int(args[0]) <= 500:
+        reply(msg, f"Напиши так: /setnorm 20. Сейчас норма {get_norm(msg['chat']['id'])} дуэлей в неделю.")
+        return
+    settings.setdefault(msg["chat"]["id"], {})["norm"] = int(args[0])
+    log_action(msg, None, f"поставил норму дуэлей {args[0]} в неделю")
+    reply(msg, f"🏁 Норма: {args[0]} дуэлей в неделю (пн–вс). Посмотреть всех: /norm all")
+    schedule_sheet_sync(msg["chat"]["id"])
+
+
+def cmd_duelhere(msg, args, my):
+    conf = settings.setdefault(msg["chat"]["id"], {})
+    if args and args[0].lower() in ("off", "выкл"):
+        conf.pop("duel_thread", None)
+        reply(msg, "Учёт дуэлей по скринам выключен.")
+        return
+    conf["duel_thread"] = msg.get("message_thread_id", 0)
+    log_action(msg, None, "включил учёт дуэлей в этой теме")
+    warn = "" if GEMINI_KEY else "\n⚠️ Ещё не задан GEMINI_API_KEY в Render — без него скрины не читаются."
+    reply(msg, "📸 Теперь бот считает дуэли по скринам «История заездов» из этой темы. "
+               f"Норма: {get_norm(msg['chat']['id'])} в неделю. Проверить себя: /norm, всех: /norm all" + warn)
+
+
+def sheet_payload(chat_id):
+    names = {u["id"]: u for u in members.get(chat_id, {}).values()}
+    duel_rows = []
+    for uid, lst in duels.get(chat_id, {}).items():
+        u = names.get(uid, {})
+        for d in lst:
+            day = datetime.date.fromisoformat(d["d"])
+            duel_rows.append([week_label(*week_bounds(day)), day.strftime("%d.%m.%Y"), u.get("first_name", str(uid)),
+                              "@" + u["username"] if u.get("username") else "", d["o"],
+                              RESULT_RU.get(d["r"], d["r"]), d["s"], d.get("t", "")])
+    duel_rows.sort(key=lambda r: (r[1][6:] + r[1][3:5] + r[1][:2], r[2]), reverse=True)
+    norm = get_norm(chat_id)
+    weeks = [week_bounds(back=i) for i in range(4)]
+    norm_rows = []
+    for p in duel_people(chat_id):
+        counts = [duels_in(chat_id, p["uid"], a, b) if p["uid"] else 0 for a, b in weeks]
+        norm_rows.append([p["name"], "@" + p["tg"] if p["tg"] else "", counts[0], norm,
+                          "✅" if counts[0] >= norm else f"осталось {norm - counts[0]}"] + counts[1:])
+    norm_rows.sort(key=lambda r: -r[2])
+    return {
+        "duels_head": ["Неделя", "Дата", "Пилот", "Телеграм", "Соперник", "Результат", "Счёт", "Трасса"],
+        "duels": duel_rows,
+        "norm_head": ["Пилот", "Телеграм", f"Эта неделя {week_label(*weeks[0])}", "Норма", "Статус"]
+                     + [week_label(*w) for w in weeks[1:]],
+        "norm": norm_rows,
+    }
+
+
+def schedule_sheet_sync(chat_id):
+    # Выгружаем в Google-таблицу через Apps Script. Ждём пару секунд, чтобы альбом ушёл одной выгрузкой.
+    if not SHEET_HOOK:
+        return
+    if _sheet["timer"]:
+        _sheet["timer"].cancel()
+    _sheet["timer"] = threading.Timer(5, sync_sheet, args=(chat_id,))
+    _sheet["timer"].start()
+
+
+def sync_sheet(chat_id):
+    try:
+        r = requests.post(SHEET_HOOK, json=sheet_payload(chat_id), timeout=30)
+        if r.status_code >= 300 or "ok" not in r.text[:50]:
+            print(f"Ошибка выгрузки в таблицу: HTTP {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        print("Ошибка выгрузки в таблицу:", e)
+
+
 HELP_TEXT = """📖 Команды бота
 
 👥 Для всех:
@@ -882,7 +1283,11 @@ HELP_TEXT = """📖 Команды бота
 /rules — правила чата
 /warns — свои предупреждения (ответом — чужие)
 /report причина — ответом на сообщение: позвать модерацию
+/norm (или «норма») — твои дуэли за неделю; /norm all — все; ответом — чужие
 /app — кнопка с таблицами клуба
+
+📸 Дуэли: кидай скрины «История заездов» в тему отчётов — бот сам посчитает
+дуэли за неделю (пн–вс), повторы со старых скринов не засчитываются.
 
 🛡 Модератор (уровень 1+):
 /warn причина — предупреждение, на {limit}-м бан
@@ -904,6 +1309,8 @@ HELP_TEXT = """📖 Команды бота
 /setrules текст — свои правила для /rules
 /setwelcome текст — приветствие новичков ({{name}} — имя)
 /welcome on|off — включить или выключить приветствие
+/duelhere — написать в теме отчётов: бот начнёт считать там дуэли (off — выключить)
+/setnorm 20 — норма дуэлей в неделю
 
 Цель команды — ответ на сообщение, @ник или упоминание.
 Модерация понимает и слова без слэша: бан, мут, кик, варн, пред, разбан, размут, разварн.
@@ -920,15 +1327,16 @@ ADMIN_CMDS = {
     "promote": (2, cmd_promote), "demote": (2, cmd_demote),
     "setrole": (2, cmd_setrole), "unrole": (2, cmd_unrole),
     "setrules": (2, cmd_setrules), "setwelcome": (2, cmd_setwelcome), "welcome": (2, cmd_welcome),
+    "setnorm": (2, cmd_setnorm), "duelhere": (2, cmd_duelhere),
 }
 SLASH_ALIASES = {"me": "profile", "mystats": "stats", "members": "roster", "roles": "team",
-                 "app": "start", "admins": "staff", "mods": "staff"}
+                 "app": "start", "admins": "staff", "mods": "staff", "duels": "norm"}
 # Слова без слэша. Модерацию понимаем в начале любого сообщения (только от модераторов),
 # остальное — только если сообщение состоит из одного этого слова, чтобы бот не влезал в разговор.
 MOD_WORDS = {"бан": "ban", "разбан": "unban", "кик": "kick", "мут": "mute", "размут": "unmute",
              "варн": "warn", "пред": "warn", "разварн": "unwarn"}
 SOLO_WORDS = {"варны": "warns", "правила": "rules", "профиль": "profile", "админы": "staff",
-              "должности": "team", "журнал": "modlog", "репорт": "report"}
+              "должности": "team", "журнал": "modlog", "репорт": "report", "норма": "norm"}
 
 
 def parse_command(text):
@@ -982,6 +1390,10 @@ def handle(msg):
             if ent.get("type") == "text_mention":
                 remember(chat_id, ent.get("user"))
 
+    if is_group and "from" in msg and is_duel_report(msg):
+        handle_duel_report(msg)
+        return
+
     text = msg.get("text", "")
     if not text or "from" not in msg:
         return
@@ -1020,6 +1432,10 @@ def handle(msg):
         reply_rules(msg)
     elif cmd == "report":
         reply_report(msg)
+    elif cmd == "norm":
+        reply_norm(msg, args)
+    elif cmd == "normall":
+        reply_norm(msg, ["all"])
     elif cmd == "all" or "созвать" in lower:
         call_everyone(msg)
     elif cmd == "start" or f"@{BOT_USERNAME}" in lower:
@@ -1037,6 +1453,8 @@ class Handler(BaseHTTPRequestHandler):
                 handle_chat_member(update["chat_member"])
             elif "message" in update:
                 handle(update["message"])
+            elif "callback_query" in update:
+                handle_callback(update["callback_query"])
         except Exception as e:
             print("Ошибка:", repr(e))
         save_state()
@@ -1057,7 +1475,8 @@ PUBLIC_MENU = [
     ("help", "Все команды"), ("all", "Отметить всех"), ("profile", "Карточка пилота"),
     ("stats", "Статистика сообщений"), ("top", "Топ по сообщениям"), ("roster", "Участники"),
     ("team", "Состав по должностям"), ("staff", "Модераторы и админы"), ("rules", "Правила чата"),
-    ("warns", "Предупреждения"), ("report", "Позвать модерацию (ответом)"), ("app", "Таблицы клуба"),
+    ("warns", "Предупреждения"), ("report", "Позвать модерацию (ответом)"),
+    ("norm", "Норма дуэлей за неделю"), ("normall", "Норма дуэлей у всех"), ("app", "Таблицы клуба"),
 ]
 ADMIN_MENU = PUBLIC_MENU + [
     ("warn", "Предупреждение"), ("mute", "Мут: /mute 30m причина"), ("unmute", "Снять мут"),
@@ -1067,6 +1486,7 @@ ADMIN_MENU = PUBLIC_MENU + [
     ("setrole", "Выдать должность"), ("unrole", "Снять должность"),
     ("setrules", "Задать правила"), ("setwelcome", "Задать приветствие"),
     ("welcome", "Приветствие вкл/выкл"), ("modlog", "Журнал модерации"),
+    ("duelhere", "Считать дуэли в этой теме"), ("setnorm", "Норма дуэлей в неделю"),
 ]
 
 
@@ -1075,7 +1495,7 @@ def setup_webhook():
     # чтобы не настраивать это вручную ссылкой setWebhook.
     url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     if url:
-        res = api("setWebhook", {"url": url + "/", "allowed_updates": ["message", "chat_member"]})
+        res = api("setWebhook", {"url": url + "/", "allowed_updates": ["message", "chat_member", "callback_query"]})
         print("Вебхук:", "настроен" if res.get("ok") else res)
     info = api("getWebhookInfo", {}).get("result", {})
     if info.get("last_error_message"):
