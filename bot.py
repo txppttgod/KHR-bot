@@ -26,7 +26,8 @@ SB_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SB_KEY = os.environ.get("SUPABASE_KEY", "")
 API = f"https://api.telegram.org/bot{TOKEN}"
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODELS = [m for m in (os.environ.get("GEMINI_MODEL", ""), "gemini-2.5-flash", "gemini-flash-latest") if m]
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "")  # можно не задавать: бот сам выберет свежую flash-модель
+GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
 SHEET_HOOK = os.environ.get("SHEET_HOOK", "")  # адрес Apps Script для выгрузки дуэлей в Google-таблицу
 
 CHUNK = 20              # сколько участников тегать в одном сообщении
@@ -911,6 +912,7 @@ RESULT_RU = {"win": "Победа", "loss": "Поражение", "draw": "Ни�
 _albums = {}       # (чат, media_group_id) → сводка по альбому, чтобы отвечать одним сообщением
 _seen_msgs = set() # уже обработанные скрины (если Телеграм пришлёт обновление повторно)
 _sheet = {"timer": None}
+_models = {"time": 0, "list": []}
 
 
 def msk_today():
@@ -962,33 +964,59 @@ def gemini_read(image, mime):
         "generationConfig": {"temperature": 0, "responseMimeType": "application/json",
                              "responseSchema": DUEL_SCHEMA},
     }
-    for model in GEMINI_MODELS:
+    last = 0
+    for model in gemini_models()[:4]:
         for attempt in range(2):
             try:
-                r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                r = requests.post(f"{GEMINI_API}/models/{model}:generateContent",
                                   headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=90)
             except Exception as e:
                 print("Ошибка связи с Gemini:", e)
                 return None, "нет связи с ИИ"
-            if r.status_code == 429 and attempt == 0:
-                time.sleep(8)  # бесплатный ключ: несколько запросов в минуту
+            if r.status_code in (429, 500, 503) and attempt == 0:
+                time.sleep(8 if r.status_code == 429 else 3)  # лимит бесплатного ключа или перегрузка
                 continue
             break
-        if r.status_code == 404:
-            print(f"Модель {model} не найдена, пробую следующую")
-            continue
-        if r.status_code == 429:
-            return None, "ИИ перегружен (лимит бесплатного ключа), перешли этот скрин чуть позже"
+        last = r.status_code
         if r.status_code >= 300:
-            print(f"Ошибка Gemini: HTTP {r.status_code} {r.text[:300]}")
-            return None, f"ошибка ИИ (HTTP {r.status_code})"
+            # Модель отключена, перегружена или упёрлась в лимит — пробуем следующую
+            print(f"Gemini {model}: HTTP {r.status_code} {r.text[:200]}")
+            continue
         try:
             parts = r.json()["candidates"][0]["content"]["parts"]
             return json.loads("".join(p.get("text", "") for p in parts if not p.get("thought"))), ""
         except Exception as e:
             print("Непонятный ответ Gemini:", e, r.text[:300])
             return None, "ИИ вернул непонятный ответ"
-    return None, "модель ИИ не найдена, проверь GEMINI_MODEL в Render"
+    if last in (429, 500, 503):
+        return None, "ИИ сейчас перегружен, модератор может перечитать скрин позже: ответь на него /recheck"
+    return None, f"ошибка ИИ (HTTP {last}), подробности в логах Render"
+
+
+def gemini_models():
+    # Google время от времени отключает старые модели, поэтому раз в сутки спрашиваем, какие есть.
+    # Порядок: GEMINI_MODEL из Render, затем свежие flash-модели (сначала обычные, потом lite и preview).
+    if time.time() - _models["time"] > 86400 or not _models["list"]:
+        found = []
+        try:
+            r = requests.get(f"{GEMINI_API}/models?pageSize=1000", headers={"x-goog-api-key": GEMINI_KEY}, timeout=20)
+            for m in r.json().get("models", []):
+                name = m.get("name", "").replace("models/", "")
+                if ("generateContent" in m.get("supportedGenerationMethods", []) and "flash" in name
+                        and not re.search(r"image|tts|audio|live|embed|native|robotics|computer|thinking", name)):
+                    found.append(name)
+        except Exception as e:
+            print("Не удалось получить список моделей Gemini:", e)
+
+        def rank(name):
+            v = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+            return ("lite" in name, bool(re.search(r"preview|exp", name)), -float(v.group(1)) if v else 0, name)
+        found.sort(key=rank)
+        if found:
+            _models["list"], _models["time"] = found, time.time()
+            print("Модели Gemini:", ", ".join(found[:6]))
+    order = [m for m in (GEMINI_MODEL, "gemini-flash-latest") if m] + (_models["list"] or ["gemini-2.5-flash"])
+    return list(dict.fromkeys(order))
 
 
 def duel_image(msg):
@@ -1222,6 +1250,24 @@ def cmd_duelhere(msg, args, my):
                f"Норма: {get_norm(msg['chat']['id'])} в неделю. Проверить себя: /norm, всех: /norm all" + warn)
 
 
+def cmd_recheck(msg, args, my):
+    # Перечитать скрин, который ИИ не смог прочитать (дуэли засчитываются автору скрина, повторы не считаются)
+    chat_id = msg["chat"]["id"]
+    src = msg.get("reply_to_message") or {}
+    author = src.get("from") or {}
+    if not duel_image(src)[0] or not author:
+        reply(msg, "Ответь /recheck на сообщение со скрином «История заездов».")
+        return
+    if author["id"] != msg["from"]["id"] and get_level(chat_id, msg["from"]["id"]) < 1:
+        reply(msg, "Перечитать чужой скрин может только модератор.")
+        return
+    _seen_msgs.discard((chat_id, src["message_id"]))
+    _albums.pop((chat_id, str(src["message_id"])), None)  # новый ответ, а не правка старой ошибки
+    src = dict(src, chat=msg["chat"])
+    src.pop("media_group_id", None)  # перечитанный скрин — отдельный отчёт со своей кнопкой отмены
+    handle_duel_report(src)
+
+
 def sheet_payload(chat_id):
     names = {u["id"]: u for u in members.get(chat_id, {}).values()}
     duel_rows = []
@@ -1288,6 +1334,7 @@ HELP_TEXT = """📖 Команды бота
 
 📸 Дуэли: кидай скрины «История заездов» в тему отчётов — бот сам посчитает
 дуэли за неделю (пн–вс), повторы со старых скринов не засчитываются.
+/recheck — ответом на свой скрин: перечитать, если ИИ не смог (модераторы — любой)
 
 🛡 Модератор (уровень 1+):
 /warn причина — предупреждение, на {limit}-м бан
@@ -1327,7 +1374,7 @@ ADMIN_CMDS = {
     "promote": (2, cmd_promote), "demote": (2, cmd_demote),
     "setrole": (2, cmd_setrole), "unrole": (2, cmd_unrole),
     "setrules": (2, cmd_setrules), "setwelcome": (2, cmd_setwelcome), "welcome": (2, cmd_welcome),
-    "setnorm": (2, cmd_setnorm), "duelhere": (2, cmd_duelhere),
+    "setnorm": (2, cmd_setnorm), "duelhere": (2, cmd_duelhere), "recheck": (0, cmd_recheck),
 }
 SLASH_ALIASES = {"me": "profile", "mystats": "stats", "members": "roster", "roles": "team",
                  "app": "start", "admins": "staff", "mods": "staff", "duels": "norm"}
@@ -1476,7 +1523,8 @@ PUBLIC_MENU = [
     ("stats", "Статистика сообщений"), ("top", "Топ по сообщениям"), ("roster", "Участники"),
     ("team", "Состав по должностям"), ("staff", "Модераторы и админы"), ("rules", "Правила чата"),
     ("warns", "Предупреждения"), ("report", "Позвать модерацию (ответом)"),
-    ("norm", "Норма дуэлей за неделю"), ("normall", "Норма дуэлей у всех"), ("app", "Таблицы клуба"),
+    ("norm", "Норма дуэлей за неделю"), ("normall", "Норма дуэлей у всех"),
+    ("recheck", "Перечитать скрин (ответом)"), ("app", "Таблицы клуба"),
 ]
 ADMIN_MENU = PUBLIC_MENU + [
     ("warn", "Предупреждение"), ("mute", "Мут: /mute 30m причина"), ("unmute", "Снять мут"),
