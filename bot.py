@@ -973,14 +973,18 @@ def gemini_read(image, mime):
         for attempt in range(2):
             try:
                 r = requests.post(f"{GEMINI_API}/models/{model}:generateContent",
-                                  headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=60)
+                                  headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=45)
             except Exception as e:
-                print("Ошибка связи с Gemini:", e)
-                return None, "нет связи с ИИ"
+                print(f"Gemini {model}: нет ответа ({e.__class__.__name__}), пробую следующую")
+                r = None
+                break
             if r.status_code in (429, 500, 503) and attempt == 0:
                 time.sleep(8 if r.status_code == 429 else 3)  # лимит бесплатного ключа или перегрузка
                 continue
             break
+        if r is None:
+            last = 503
+            continue
         last = r.status_code
         if r.status_code >= 300:
             # Модель отключена, перегружена или упёрлась в лимит — пробуем следующую
@@ -1019,7 +1023,8 @@ def gemini_models():
         if found:
             _models["list"], _models["time"] = found, time.time()
             print("Модели Gemini:", ", ".join(found[:6]))
-    order = [m for m in (GEMINI_MODEL, "gemini-flash-latest") if m] + (_models["list"] or ["gemini-2.5-flash"])
+    # gemini-flash-latest — только запасной вариант: на нём чаще всего «перегружено»
+    order = [m for m in (GEMINI_MODEL,) if m] + (_models["list"] or ["gemini-2.5-flash"]) + ["gemini-flash-latest"]
     return list(dict.fromkeys(order))
 
 
