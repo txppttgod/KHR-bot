@@ -1207,9 +1207,17 @@ def handle_callback(cq):
     _, uid, group = data.split(":", 2)
     uid = int(uid)
     clicker = cq["from"]
-    if clicker["id"] != uid and get_level(chat_id, clicker["id"]) < 1:
-        api("answerCallbackQuery", {"callback_query_id": cq["id"], "show_alert": True,
-                                    "text": "Отменить отчёт может только его автор или модератор."})
+    # Отменять могут только администраторы: свои отчёты и отчёты тех, кто ниже рангом.
+    # Отчёты администраторов отменяет владелец.
+    my = get_level(chat_id, clicker["id"])
+    if my < 2:
+        deny = "Отменять отчёты могут только администраторы."
+    elif clicker["id"] != uid and get_level(chat_id, uid) >= my:
+        deny = "Отчёт администратора может отменить только владелец."
+    else:
+        deny = ""
+    if deny:
+        api("answerCallbackQuery", {"callback_query_id": cq["id"], "show_alert": True, "text": deny})
         return
     mine = duels.get(chat_id, {}).get(uid, [])
     removed = sum(1 for d in mine if d.get("g") == group)
