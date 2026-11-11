@@ -1090,6 +1090,9 @@ def uid_by_game_name(chat_id, name):
     return None
 
 
+OPPOSITE = {"win": "loss", "loss": "win", "draw": "draw"}
+
+
 def mirror(score):
     parts = score.split(" / ")
     return f"{parts[1]} / {parts[0]}" if len(parts) == 2 else score
@@ -1098,11 +1101,14 @@ def mirror(score):
 def add_duels(chat_id, uid, opponent, rows, group, items=None, alerts=None):
     # Возвращает (новых, повторов, вне срока). В items дописывает каждую строку скрина с её судьбой,
     # чтобы бот показал в ответе, что именно прочитал и куда засчитал.
-    # Дуэль «подтверждена», если соперник из клуба тоже сдал её. В alerts — подозрение на накрутку:
-    # другой участник уже сдал те же дуэли с тем же соперником (значит, это один и тот же скрин).
+    # Дуэль с участником клуба засчитывается обоим с первого же скрина: сопернику она пишется
+    # с пометкой «by» (по чьему отчёту). Когда соперник потом сдаёт ту же дуэль со своей стороны,
+    # второй раз она не считается, а помечается «c» — подтверждена обоими.
+    # В alerts — подозрение на накрутку: другой участник уже сдал те же дуэли с тем же соперником.
     items = [] if items is None else items
     mine = duels.setdefault(chat_id, {}).setdefault(uid, [])
     have = {(d["d"], d["o"].lower(), d["s"]) for d in mine}
+    have |= {(d, o, mirror(s)) for d, o, s in have}  # у соперника счёт может быть записан наоборот
     today = msk_today()
     oldest = today - datetime.timedelta(days=DUEL_KEEP_DAYS)
     added = dup = skip = 0
@@ -1124,20 +1130,42 @@ def add_duels(chat_id, uid, opponent, rows, group, items=None, alerts=None):
         key = (day.isoformat(), opp.lower(), score)
         if key in have:
             dup += 1
-            items.append((day, opp, res, score, "dup"))
+            ex = next((d for d in mine if d["d"] == key[0] and d["o"].lower() == key[1]
+                       and d["s"] in (score, mirror(score))), {})
+            if ex.get("by") and ex["by"] != uid:
+                # Эту дуэль уже засчитали по отчёту соперника — теперь её подтвердили обе стороны
+                ex["c"] = 1
+                for d in duels[chat_id].get(ex["by"], []):
+                    if d["d"] == key[0] and d.get("g") == ex.get("g") and d["s"] in (score, mirror(score)):
+                        d["c"] = 1
+                items.append((day, opp, res, score, "conf"))
+            else:
+                items.append((day, opp, res, score, "dup"))
             continue
         have.add(key)
+        have.add((key[0], key[1], mirror(score)))
         rec = {"d": key[0], "o": opp, "r": res, "s": score, "t": (row.get("track") or "")[:40], "g": group}
+        credited = False
         if opp_uid and opp_uid != uid and my_name:
-            for d in duels[chat_id].get(opp_uid, []):
-                if d["d"] == rec["d"] and d["o"].lower() == my_name.lower() and d["s"] in (score, mirror(score)):
-                    d["c"] = rec["c"] = 1
+            theirs = duels[chat_id].setdefault(opp_uid, [])
+            old = [d for d in theirs if d["d"] == rec["d"] and d["o"].lower() == my_name.lower()
+                   and d["s"] in (score, mirror(score))]
+            if old:  # соперник сдал её раньше, когда зачёт обоим ещё не работал
+                for d in old:
+                    d["c"] = 1
+                rec["c"] = 1
+            else:
+                theirs.append({"d": rec["d"], "o": my_name, "r": OPPOSITE.get(res, res), "s": mirror(score),
+                               "t": rec["t"], "g": group, "by": uid})
+                theirs.sort(key=lambda d: d["d"])
+                credited = True
         for other, lst in duels[chat_id].items():
-            if other != uid and any(d["d"] == rec["d"] and d["o"].lower() == opp.lower() and d["s"] == score for d in lst):
+            if other not in (uid, opp_uid) and any(d["d"] == rec["d"] and d["o"].lower() == opp.lower()
+                                                   and d["s"] == score for d in lst):
                 same[other] = same.get(other, 0) + 1
         mine.append(rec)
         added += 1
-        items.append((day, opp, res, score, "new", rec.get("c")))
+        items.append((day, opp, res, score, "new", rec.get("c"), credited))
     mine.sort(key=lambda d: d["d"])
     if alerts is not None:
         # Одна совпавшая дуэль «100 / 100» бывает и честно, поэтому шумим от двух совпадений
@@ -1178,8 +1206,11 @@ def duel_report_text(chat_id, user, s):
                 where = "эта неделя" if ws == start else f"неделя {week_label(ws, we)}"
                 if extra and extra[0]:
                     where += " ✔ подтверждена соперником"
+                if len(extra) > 1 and extra[1]:
+                    where += " · засчитана и сопернику"
             else:
-                where = {"dup": "уже засчитана раньше", "skip": "вне срока"}[status]
+                where = {"dup": "уже засчитана раньше", "skip": "вне срока",
+                         "conf": "уже засчитана по отчёту соперника ✔ подтверждена"}[status]
             lines.append(f"{when} vs {opp} — {RESULT_RU.get(res, res)} ({score}) → {where}")
         if len(items) > 25:
             lines.append(f"…и ещё {len(items) - 25}")
@@ -1307,9 +1338,13 @@ def handle_callback(cq):
         api("answerCallbackQuery", {"callback_query_id": cq["id"], "show_alert": True, "text": deny})
         return
     mine = duels.get(chat_id, {}).get(uid, [])
-    removed = sum(1 for d in mine if d.get("g") == group)
+    removed = sum(1 for d in mine if d.get("g") == group and not d.get("by"))
     if uid in duels.get(chat_id, {}):
-        duels[chat_id][uid] = [d for d in mine if d.get("g") != group]
+        duels[chat_id][uid] = [d for d in mine if d.get("g") != group or d.get("by")]
+    # Снимаем и дуэли, которые этот отчёт засчитал соперникам
+    for other, lst in duels.get(chat_id, {}).items():
+        if other != uid:
+            duels[chat_id][other] = [d for d in lst if not (d.get("by") == uid and d.get("g") == group)]
     start, end = week_bounds()
     week = duels_in(chat_id, uid, start, end)
     text = (msg.get("text", "") + f"\n\n❌ Отменено ({name_of(clicker)}): снято дуэлей {removed}. "
@@ -1442,7 +1477,8 @@ def sheet_payload(chat_id):
             day = datetime.date.fromisoformat(d["d"])
             duel_rows.append([week_label(*week_bounds(day)), day.strftime("%d.%m.%Y"), u.get("first_name", str(uid)),
                               "@" + u["username"] if u.get("username") else "", d["o"],
-                              RESULT_RU.get(d["r"], d["r"]), d["s"], d.get("t", ""), "✔" if d.get("c") else ""])
+                              RESULT_RU.get(d["r"], d["r"]), d["s"], d.get("t", ""),
+                              "✔ сдали оба" if d.get("c") else "по отчёту соперника" if d.get("by") else ""])
     duel_rows.sort(key=lambda r: (r[1][6:] + r[1][3:5] + r[1][:2], r[2]), reverse=True)
     norm = get_norm(chat_id)
     weeks = [week_bounds(back=i) for i in range(4)]
@@ -1454,7 +1490,7 @@ def sheet_payload(chat_id):
     norm_rows.sort(key=lambda r: -r[2])
     return {
         "duels_head": ["Неделя", "Дата", "Пилот", "Телеграм", "Соперник", "Результат", "Счёт", "Трасса",
-                       "Подтверждена соперником"],
+                       "Отметка"],
         "duels": duel_rows,
         "norm_head": ["Пилот", "Телеграм", f"Эта неделя {week_label(*weeks[0])}", "Норма", "Статус"]
                      + [week_label(*w) for w in weeks[1:]],
@@ -1603,6 +1639,33 @@ def norm_warn_callback(cq):
     answer(f"Варн выдан: {name_of(target)}")
 
 
+DM_TEST_TEXT = ("✅ Тест: бот может писать вам в ЛС.\n"
+                "Сюда по понедельникам будет приходить список не выполнивших норму с кнопками варна, "
+                "а также сигналы о возможной накрутке дуэлей.")
+
+
+def private_dmtest(msg, args):
+    # /dmtest в ЛС бота — проверка, что сообщения админам доходят. /dmtest all — разослать всем админам клуба.
+    uid = msg["from"]["id"]
+    chats = [c for c, conf in settings.items() if "duel_thread" in conf]
+    if not chats or get_level(chats[0], uid) < 2:
+        reply(msg, "Проверка ЛС доступна только администраторам клуба.")
+        return
+    chat_id = chats[0]
+    if not (args and args[0].lower() in ("all", "все")):
+        reply(msg, DM_TEST_TEXT + "\n\n/dmtest all — проверить, доходят ли сообщения всем админам.")
+        return
+    ok, fail = [], []
+    for a in get_admins(chat_id):
+        user = a["user"]
+        r = api("sendMessage", {"chat_id": user["id"], "text": DM_TEST_TEXT + f"\n(проверку запустил {name_of(msg['from'])})"})
+        (ok if r.get("ok") else fail).append(name_of(user) + (f" @{user['username']}" if user.get("username") else ""))
+    text = "📨 Проверка ЛС админов.\nДоходит: " + (", ".join(ok) or "никому")
+    if fail:
+        text += f"\nНе доходит: {', '.join(fail)} — им нужно открыть @{BOT_USERNAME} и нажать Start."
+    reply(msg, text)
+
+
 def backup_state(now):
     # Копия всей базы в отдельную строку bot_state: backup_mon … backup_sun, то есть хранится неделя копий
     try:
@@ -1675,6 +1738,7 @@ HELP_TEXT = """📖 Команды бота
 
 📸 Дуэли: кидай скрины «История заездов» в тему отчётов — бот сам посчитает
 дуэли за неделю (пн–вс), повторы со старых скринов не засчитываются.
+Дуэль с участником клуба засчитывается обоим с первого скрина — второму сдавать её не нужно.
 /recheck — ответом на свой скрин: перечитать, если ИИ не смог (модераторы — любой)
 
 🛡 Модератор (уровень 1+):
@@ -1702,7 +1766,7 @@ HELP_TEXT = """📖 Команды бота
 
 🤖 Сам бот: в пятницу 18:00 напоминает тем, у кого меньше половины нормы, в понедельник 10:00 подводит
 итоги недели. Админам в ЛС приходит список не выполнивших норму с кнопками варна и сигналы о возможной
-накрутке. Чтобы получать ЛС, открой бота и нажми Start.
+накрутке. Чтобы получать ЛС, открой бота и нажми Start. Проверка: /dmtest в ЛС бота (/dmtest all — всем админам).
 
 Цель команды — ответ на сообщение, @ник или упоминание.
 Модерация понимает и слова без слэша: бан, мут, кик, варн, пред, разбан, размут, разварн.
@@ -1810,6 +1874,9 @@ def handle(msg):
         return
 
     if not is_group:
+        if cmd == "dmtest":
+            private_dmtest(msg, args)
+            return
         if cmd == "start":
             send(chat_id, "Привет! Нажми кнопку ниже, чтобы открыть таблицы клуба.")
         return
