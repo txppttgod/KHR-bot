@@ -315,6 +315,47 @@ c = press(OWNER, btn["callback_data"])
 check("no double warn", DB["data"]["warns"].get(f"{CHAT}_{USER2}") == before + 1 and any("уже выдан" in p.get("text", "") for m, p in c if m == "answerCallbackQuery"), c)
 calls.clear(); bot.scheduler_tick(nmon + _dt.timedelta(hours=2))
 check("summary once", not any(c == "sendMessage" for c, _ in calls), [])
+
+# ---------- профиль участника в ЛС: фото машины, подпись, модерация ----------
+def dm(uid, **fields):
+    mid[0] += 1
+    m = {"message_id": mid[0], "chat": {"id": uid, "type": "private"}, "from": u(uid)}
+    m.update(fields)
+    calls.clear(); bot.load_state(); bot.handle(m); bot.save_state()
+    return list(calls)
+def tap(uid, data, chat=None, **msg):
+    calls.clear(); bot.load_state()
+    bot.handle_callback({"id": "q", "from": u(uid), "data": data,
+                         "message": dict({"message_id": 9, "chat": {"id": chat or uid}}, **msg)})
+    bot.save_state(); return list(calls)
+texts = lambda c: " || ".join((p or {}).get("text", "") or (p or {}).get("caption", "") for m, p in c
+                              if m in ("sendMessage", "sendPhoto", "answerCallbackQuery"))
+c = dm(USER, text="/myprofile"); check("profile only for table pilots", "таблице пилотов" in texts(c), [])
+c = dm(USER2, text="/myprofile")
+check("profile menu", "ливрее клуба KHR" in texts(c) and any(m == "sendMessage" and p.get("reply_markup") for m, p in c), [])
+c = dm(USER2, photo=[{"file_id": "early"}]); check("photo without request gets hint", "/myprofile" in texts(c), [])
+c = tap(USER2, "pf:car"); check("car prompt mentions club livery", "обязательно должна быть в ливрее клуба KHR" in texts(c), [])
+c = dm(USER2, photo=[{"file_id": "s"}, {"file_id": "car1"}])
+check("photo preview with confirm", any(m == "sendPhoto" and p["photo"] == "car1" and "pf:ok" in json.dumps(p["reply_markup"]) for m, p in c), [])
+c = tap(USER2, "pf:ok")
+admin_photos = [p for m, p in c if m == "sendPhoto" and p["chat_id"] in (OWNER, ADMIN)]
+check("car saved and admins notified", "Готово" in texts(c) and len(admin_photos) == 2
+      and admin_photos[0]["reply_markup"]["inline_keyboard"][0][0]["callback_data"].startswith(f"pfdel:{USER2}:"), [])
+j = bot.duels_json(); check("profile in app data", j["profiles"].get("petya", {}).get("photo", 0) > 0, [("sendMessage", {"text": str(j.get("profiles"))})])
+check("photo served by bot", bot.profile_photo("@Petya") == b"\xff\xd8fakejpeg" and bot.profile_photo("nobody") is None, [])
+tap(USER2, "pf:about"); c = dm(USER2, text="Тандем-пилот, люблю Ebisu")
+check("about saved", "Подпись сохранена" in texts(c) and bot.duels_json()["profiles"]["petya"]["about"] == "Тандем-пилот, люблю Ebisu", [])
+c = dm(USER2, text="x" * 150); check("plain text after about is not captured", "Подпись" not in texts(c), [])
+tap(USER2, "pf:about"); c = dm(USER2, text="x" * 150)
+check("about cut to 100", "обрезал" in texts(c) and len(bot.duels_json()["profiles"]["petya"]["about"]) == 100, [])
+c = tap(USER2, "pf:view"); check("view profile", any(m == "sendPhoto" and "Petya" in p["caption"] for m, p in c), [])
+del_data = admin_photos[0]["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+c = tap(USER, del_data, chat=USER, caption="фото"); check("member cannot remove photo", any(p.get("show_alert") for m, p in c if m == "answerCallbackQuery"), [])
+c = tap(ADMIN, del_data, chat=ADMIN, caption="фото")
+check("admin removes photo", bot.profile_photo("petya") is None and any(m == "sendMessage" and p["chat_id"] == USER2 and "ливрее клуба" in p["text"] for m, p in c)
+      and any(m == "editMessageCaption" for m, _ in c), [])
+c = tap(OWNER, del_data, chat=OWNER, caption="фото"); check("remove twice is harmless", "уже заменили или убрали" in texts(c), [])
+r = send(USER2, "/myprofile"); check("group points to DM", any("start=profile" in json.dumps(p.get("reply_markup", {})) for c2, p in r), r)
 print("\n".join(checks))
 failed = sum(c.startswith("FAIL") for c in checks)
 print("FAILED:", failed, "of", len(checks))
