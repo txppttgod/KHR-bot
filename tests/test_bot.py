@@ -71,6 +71,8 @@ BOT_PY = "bot.py" if os.path.exists("bot.py") else os.path.join(os.path.dirname(
 src = open(BOT_PY, encoding="utf-8").read()
 bot = types.ModuleType("bot")
 exec(compile(src, "bot.py", "exec"), bot.__dict__)
+# В старых проверках дуэли с выдуманными соперниками и маленькими баллами — правила нормы проверяются отдельно ниже
+bot.MIN_SCORE, bot.CLUB_ONLY = 0, False
 
 CHAT = -1001
 OWNER, ADMIN, MOD, USER, USER2 = 1, 2, 3, 4, 5
@@ -356,6 +358,23 @@ check("admin removes photo", bot.profile_photo("petya") is None and any(m == "se
       and any(m == "editMessageCaption" for m, _ in c), [])
 c = tap(OWNER, del_data, chat=OWNER, caption="фото"); check("remove twice is harmless", "уже заменили или убрали" in texts(c), [])
 r = send(USER2, "/myprofile"); check("group points to DM", any("start=profile" in json.dumps(p.get("reply_markup", {})) for c2, p in r), r)
+
+# ---------- правила нормы: не меньше 100.1 балла и соперник из клуба ----------
+bot.MIN_SCORE, bot.CLUB_ONLY = 100.1, True
+wk = bot.week_bounds()
+bot.load_state(); own0, petya0 = bot.duels_in(CHAT, OWNER, *wk), bot.duels_in(CHAT, USER2, *wk)
+ans("Petya", [(iso(today), "win", "150.5 / 0"), (iso(today), "draw", "100 / 100"), (iso(today), "loss", "99.9 / 130")])
+r = photo(OWNER); bot.load_state()
+check("low scores not counted", "Засчитано новых дуэлей: 1" in said(r) and "не в норму: меньше 100.1 балла" in said(r)
+      and bot.duels_in(CHAT, OWNER, *wk) == own0 + 1, r)
+check("opponent counted only where he scored", "засчитана и сопернику" in said(r) and "сопернику не в норму" in said(r)
+      and bot.duels_in(CHAT, USER2, *wk) == petya0 + 1, r)
+ans("Stranger", [(iso(today), "win", "180 / 170")]); r = photo(OWNER); bot.load_state()
+check("only club opponents", "соперник не из клуба" in said(r) and "Засчитано новых дуэлей: 0" in said(r)
+      and bot.duels_in(CHAT, OWNER, *wk) == own0 + 1, r)
+check("100.1 exactly counts", not bot.why_not_counted({"s": "100.1 / 0", "o": "Petya"}) and bot.why_not_counted({"s": "100.0 / 0", "o": "Petya"}), [])
+r = send(OWNER, "/norm"); check("norm shows why", "✗ не в норму" in said(r), r)
+check("sheet shows why", any(row[-1].startswith("не в норму") for row in bot.sheet_payload(CHAT)["duels"]), [])
 print("\n".join(checks))
 failed = sum(c.startswith("FAIL") for c in checks)
 print("FAILED:", failed, "of", len(checks))
