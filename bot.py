@@ -914,6 +914,7 @@ _albums = {}       # (чат, media_group_id) → сводка по альбом
 _seen_msgs = set() # уже обработанные скрины (если Телеграм пришлёт обновление повторно)
 _sheet = {"timer": None}
 _models = {"time": 0, "list": []}
+_cooldown = {}               # модель → до какого времени её не трогать (лимит, отключена, молчит)
 LOCK = threading.RLock()     # база и память бота: меняет только один поток за раз
 DUEL_QUEUE = queue.Queue()   # скрины ждут, пока их прочитает ИИ
 DUEL_ASYNC = False           # при запуске на сервере включается; в тестах скрины читаются сразу
@@ -973,7 +974,10 @@ def gemini_read(image, mime):
         {"inline_data": {"mime_type": mime, "data": base64.b64encode(image).decode()}},
     ]}]
     last = 0
-    for model in gemini_models()[:3]:
+    # Модели, которые недавно упёрлись в лимит или молчали, на время пропускаем — сразу берём рабочую
+    now = time.time()
+    models = [m for m in gemini_models() if _cooldown.get(m, 0) < now] or gemini_models()
+    for model in models[:3]:
         think, retried = thinking_config(model), False
         for _ in range(3):
             cfg = {"temperature": 0, "responseMimeType": "application/json", "responseSchema": DUEL_SCHEMA}
@@ -1001,8 +1005,11 @@ def gemini_read(image, mime):
             break
         if r is None:
             last = 503
+            _cooldown[model] = time.time() + 3600
             continue
         last = r.status_code
+        if r.status_code in (404, 429):
+            _cooldown[model] = time.time() + (86400 if r.status_code == 404 else 3600)
         if r.status_code >= 300:
             # Модель отключена, перегружена или упёрлась в лимит — пробуем следующую
             print(f"Gemini {model}: HTTP {r.status_code} {r.text[:200]}")
@@ -1062,8 +1069,10 @@ def is_duel_report(msg):
     return msg.get("message_thread_id", 0) == conf["duel_thread"] and duel_image(msg)[0] is not None
 
 
-def add_duels(chat_id, uid, opponent, rows, group):
-    # Возвращает (новых, повторов, вне срока)
+def add_duels(chat_id, uid, opponent, rows, group, items=None):
+    # Возвращает (новых, повторов, вне срока). В items дописывает каждую строку скрина с её судьбой,
+    # чтобы бот показал в ответе, что именно прочитал и куда засчитал.
+    items = [] if items is None else items
     mine = duels.setdefault(chat_id, {}).setdefault(uid, [])
     have = {(d["d"], d["o"].lower(), d["s"]) for d in mine}
     today = msk_today()
@@ -1071,22 +1080,27 @@ def add_duels(chat_id, uid, opponent, rows, group):
     added = dup = skip = 0
     opp = re.sub(r"^\s*vs\.?\s*", "", opponent or "", flags=re.I).strip() or "?"
     for row in rows:
+        score, res = norm_score(row.get("score")), row.get("result", "")
         try:
             day = datetime.date.fromisoformat(str(row.get("date", "")).strip())
         except ValueError:
             skip += 1
+            items.append((None, opp, res, score, "skip"))
             continue
         if day > today + datetime.timedelta(days=1) or day < oldest:
             skip += 1
+            items.append((day, opp, res, score, "skip"))
             continue
-        key = (day.isoformat(), opp.lower(), norm_score(row.get("score")))
+        key = (day.isoformat(), opp.lower(), score)
         if key in have:
             dup += 1
+            items.append((day, opp, res, score, "dup"))
             continue
         have.add(key)
-        mine.append({"d": key[0], "o": opp, "r": row.get("result", ""), "s": key[2],
+        mine.append({"d": key[0], "o": opp, "r": res, "s": score,
                      "t": (row.get("track") or "")[:40], "g": group})
         added += 1
+        items.append((day, opp, res, score, "new"))
     mine.sort(key=lambda d: d["d"])
     return added, dup, skip
 
@@ -1110,6 +1124,20 @@ def duel_report_text(chat_id, user, s):
         extra.append(f"вне срока или без даты: {s['skip']}")
     if extra:
         lines.append(" · ".join(extra).capitalize())
+    items = s.get("items", [])
+    if items:
+        # Каждая прочитанная дуэль и куда она пошла: так видно, почему «за неделю» меньше, чем на скрине
+        lines.append("")
+        for day, opp, res, score, status in items[:25]:
+            when = f"{day:%d.%m}" if day else "без даты"
+            if status == "new":
+                ws, we = week_bounds(day)
+                where = "эта неделя" if ws == start else f"неделя {week_label(ws, we)}"
+            else:
+                where = {"dup": "уже засчитана раньше", "skip": "вне срока"}[status]
+            lines.append(f"{when} vs {opp} — {RESULT_RU.get(res, res)} ({score}) → {where}")
+        if len(items) > 25:
+            lines.append(f"…и ещё {len(items) - 25}")
     if s["bad"]:
         lines.append(f"Не похоже на «Историю заездов»: {s['bad']} скрин.")
     for e in s["errors"]:
@@ -1164,7 +1192,7 @@ def apply_duel(msg, res, err):
     key = (chat_id, group)
     s = _albums.get(key)
     if not s:
-        s = _albums[key] = {"added": 0, "dup": 0, "skip": 0, "bad": 0, "errors": [], "reply": None,
+        s = _albums[key] = {"added": 0, "dup": 0, "skip": 0, "bad": 0, "errors": [], "reply": None, "items": [],
                             "uid": user["id"], "t": time.time()}
     for k in [k for k, v in _albums.items() if time.time() - v["t"] > 3600]:
         del _albums[k]
@@ -1175,7 +1203,7 @@ def apply_duel(msg, res, err):
     elif not res.get("is_duel_history") or not res.get("rows"):
         s["bad"] += 1
     else:
-        a, d, k = add_duels(chat_id, user["id"], res.get("opponent"), res["rows"], group)
+        a, d, k = add_duels(chat_id, user["id"], res.get("opponent"), res["rows"], group, s["items"])
         s["added"] += a
         s["dup"] += d
         s["skip"] += k
@@ -1325,6 +1353,25 @@ def cmd_recheck(msg, args, my):
     src = dict(src, chat=msg["chat"])
     src.pop("media_group_id", None)  # перечитанный скрин — отдельный отчёт со своей кнопкой отмены
     handle_duel_report(src)
+
+
+def duels_json():
+    with LOCK:
+        load_state()
+        start, end = week_bounds()
+        pstart, pend = week_bounds(back=1)
+        norm, pilots = DUEL_NORM_DEFAULT, {}
+        for chat_id, people in duels.items():
+            norm = get_norm(chat_id)
+            for uid, lst in people.items():
+                uname = (members.get(chat_id, {}).get(uid, {}).get("username") or "").lower()
+                if not uname:
+                    continue
+                p = pilots.setdefault(uname, {"week": 0, "prev": 0, "total": 0})
+                p["week"] += duels_in(chat_id, uid, start, end)
+                p["prev"] += duels_in(chat_id, uid, pstart, pend)
+                p["total"] += len(lst)
+        return {"week": week_label(start, end), "prev_week": week_label(pstart, pend), "norm": norm, "pilots": pilots}
 
 
 def sheet_payload(chat_id):
@@ -1572,6 +1619,20 @@ class Handler(BaseHTTPRequestHandler):
             save_state()
 
     def do_GET(self):
+        if self.path.startswith("/duels"):
+            # Дуэли для мини-приложения (вкладка «Пилоты»): по @нику — сколько за эту и прошлую неделю
+            try:
+                body = json.dumps(duels_json(), ensure_ascii=False).encode()
+            except Exception as e:
+                print("Ошибка /duels:", repr(e))
+                body = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"bot is running")
