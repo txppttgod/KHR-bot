@@ -10,6 +10,7 @@ import datetime
 import threading
 import requests
 import queue
+from urllib.parse import unquote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Без этого Python на Render копит print() в буфере, и в Logs ничего не видно
@@ -109,7 +110,7 @@ def load_state():
     # Читаем базу перед каждым сообщением. Раньше она читалась один раз при запуске,
     # и если в этот момент Supabase не ответил, бот до перезапуска ничего не сохранял.
     # Так же не теряются данные, когда Render при деплое ненадолго держит две копии бота.
-    global DB_OK, members, stats, warns, staff, roles, settings, modlog, duels
+    global DB_OK, members, stats, warns, staff, roles, settings, modlog, duels, profiles
     ok, d = db_load()
     DB_OK = ok
     if not ok:
@@ -121,6 +122,7 @@ def load_state():
     settings = int_keys(d.get("settings", {}), 1)  # чат → {rules, welcome, welcome_off}
     modlog = int_keys(d.get("modlog", {}), 1)      # чат → [последние действия]
     duels = int_keys(d.get("duels", {}))        # чат → {человек: [дуэли]}
+    profiles = int_keys(d.get("profiles", {}), 1)  # человек → {car, about, username, …}
     warns = {}
     for k, n in d.get("warns", {}).items():
         c, u = k.split("_")
@@ -142,11 +144,12 @@ def state_dict():
         "settings": str_keys(settings, 1),
         "modlog": str_keys(modlog, 1),
         "duels": str_keys(duels),
+        "profiles": str_keys(profiles, 1),
         "warns": {f"{c}_{u}": n for (c, u), n in warns.items()},
     })
 
 
-members, stats, warns, staff, roles, settings, modlog, duels = {}, {}, {}, {}, {}, {}, {}, {}
+members, stats, warns, staff, roles, settings, modlog, duels, profiles = {}, {}, {}, {}, {}, {}, {}, {}, {}
 load_state()
 _cache = {"time": 0, "rows": []}
 
@@ -1317,6 +1320,12 @@ def handle_callback(cq):
     if data.startswith("nw:"):
         norm_warn_callback(cq)
         return
+    if data.startswith("pf:"):
+        profile_callback(cq)
+        return
+    if data.startswith("pfdel:"):
+        photo_remove_callback(cq)
+        return
     msg = cq.get("message") or {}
     chat_id = (msg.get("chat") or {}).get("id")
     if not data.startswith("du:") or not chat_id:
@@ -1465,7 +1474,12 @@ def duels_json():
                 p["week"] += duels_in(chat_id, uid, start, end)
                 p["prev"] += duels_in(chat_id, uid, pstart, pend)
                 p["total"] += len(lst)
-        return {"week": week_label(start, end), "prev_week": week_label(pstart, pend), "norm": norm, "pilots": pilots}
+        # Профили: есть ли фото машины (v — версия, чтобы сайт подхватил новое фото) и подпись
+        prof = {(p.get("username") or "").lower(): {"photo": p.get("v", 0) if p.get("car") else 0,
+                                                    "about": p.get("about", "")}
+                for p in profiles.values() if p.get("username") and (p.get("car") or p.get("about"))}
+        return {"week": week_label(start, end), "prev_week": week_label(pstart, pend), "norm": norm,
+                "pilots": pilots, "profiles": prof}
 
 
 def sheet_payload(chat_id):
@@ -1639,6 +1653,191 @@ def norm_warn_callback(cq):
     answer(f"Варн выдан: {name_of(target)}")
 
 
+# ---------- Профиль участника: фото машины и подпись, оформляются в ЛС бота ----------
+ABOUT_MAX = 100
+PROFILE_INTRO = ("🏎 Твой профиль в приложении клуба.\n"
+                 "Здесь можно поставить фото своей машины и короткую подпись — их увидят все во вкладке «Пилоты».\n\n"
+                 "Машина на фото обязательно должна быть в ливрее клуба KHR.")
+CAR_PROMPT = ("🚗 Пришли скрин своей машины из игры одним фото.\n\n"
+              "Важно: машина обязательно должна быть в ливрее клуба KHR. "
+              "Фото без клубной ливреи админы уберут.")
+_photo_cache = {}  # @ник → (file_id, байты): чтобы не качать одно фото из Телеграма на каждый показ
+
+
+def club_chat():
+    return next((c for c, conf in settings.items() if "duel_thread" in conf), None)
+
+
+def can_have_profile(user):
+    # Профиль только у пилотов из таблицы клуба (по @нику в Телеграме)
+    uname = (user or {}).get("username") or ""
+    return bool(uname) and find_pilot(uname) is not None
+
+
+def profile_menu(chat_id, text):
+    kb = [[{"text": "🚗 Фото машины", "callback_data": "pf:car"}],
+          [{"text": "📝 О себе", "callback_data": "pf:about"}, {"text": "👁 Мой профиль", "callback_data": "pf:view"}],
+          [{"text": "🗑 Убрать фото", "callback_data": "pf:del"}]]
+    api("sendMessage", {"chat_id": chat_id, "text": text, "reply_markup": {"inline_keyboard": kb}})
+
+
+def myprofile(msg):
+    user = msg["from"]
+    if msg["chat"]["type"] != "private":
+        payload = {"chat_id": msg["chat"]["id"], "text": "Профиль оформляется в личке бота — нажми кнопку ниже.",
+                   "reply_parameters": {"message_id": msg["message_id"], "allow_sending_without_reply": True},
+                   "reply_markup": {"inline_keyboard": [[{"text": "🏎 Оформить профиль",
+                                                          "url": f"https://t.me/{BOT_USERNAME}?start=profile"}]]}}
+        if msg.get("message_thread_id"):
+            payload["message_thread_id"] = msg["message_thread_id"]
+        api("sendMessage", payload)
+        return
+    if not can_have_profile(user):
+        reply(msg, "Профиль можно оформить, только если ты есть в таблице пилотов клуба (бот ищет тебя по @нику "
+                   "в Телеграме). Попроси админа добавить тебя в таблицу.")
+        return
+    profiles.setdefault(user["id"], {}).pop("await", None)
+    profiles[user["id"]]["username"] = user.get("username", "")
+    profile_menu(msg["chat"]["id"], PROFILE_INTRO)
+
+
+def profile_text(user, p):
+    r = find_pilot(user.get("username", "")) if user.get("username") else None
+    lines = [f"👤 {col(r, 1) if r else name_of(user)}" + (f" · №{col(r, 0)}" if r else "")]
+    if r:
+        lines.append(f"Роль: {col(r, 6)}")
+    lines.append(f"О себе: {p.get('about') or '—'}")
+    if not p.get("car"):
+        lines.append("Фото машины ещё нет — нажми «🚗 Фото машины».")
+    return "\n".join(lines)
+
+
+def notify_new_car(uid, user, p):
+    chat_id = club_chat()
+    if not chat_id:
+        return
+    who = name_of(user) + (f" @{user['username']}" if user.get("username") else "")
+    for admin in admin_ids(chat_id):
+        api("sendPhoto", {"chat_id": admin, "photo": p["car"],
+                          "caption": f"🚗 {who} поставил(а) новое фото машины в профиль.\n"
+                                     "Если машина не в ливрее клуба или фото неуместное — убери его.",
+                          "reply_markup": {"inline_keyboard": [[{"text": "🗑 Убрать фото",
+                                                                 "callback_data": f"pfdel:{uid}:{p['v']}"}]]}})
+
+
+def profile_callback(cq):
+    action = cq["data"].split(":", 1)[1]
+    user, uid = cq["from"], cq["from"]["id"]
+    chat_id = (cq.get("message") or {}).get("chat", {}).get("id", uid)
+    answer = lambda text="", alert=False: api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": text,
+                                                                      "show_alert": alert})
+    if not can_have_profile(user):
+        answer("Профиль можно оформить, только если ты есть в таблице пилотов клуба.", True)
+        return
+    p = profiles.setdefault(uid, {})
+    p["username"] = user.get("username", "")
+    if action in ("car", "again"):
+        p["await"] = "car"
+        api("sendMessage", {"chat_id": chat_id, "text": CAR_PROMPT})
+    elif action == "about":
+        p["await"] = "about"
+        api("sendMessage", {"chat_id": chat_id, "text": f"📝 Напиши о себе одним сообщением, до {ABOUT_MAX} символов.\n"
+                                                        "Например: «Тандем-пилот, люблю Ebisu». Чтобы убрать подпись — пришли «-»."})
+    elif action == "view":
+        if p.get("car"):
+            api("sendPhoto", {"chat_id": chat_id, "photo": p["car"], "caption": profile_text(user, p)})
+        else:
+            api("sendMessage", {"chat_id": chat_id, "text": profile_text(user, p)})
+    elif action == "del":
+        had = p.pop("car", None)
+        p.pop("pending", None)
+        api("sendMessage", {"chat_id": chat_id, "text": "🗑 Фото машины убрано из профиля." if had else "Фото и так нет."})
+    elif action == "ok":
+        if not p.get("pending"):
+            answer("Сначала пришли фото машины.", True)
+            return
+        p["car"] = p.pop("pending")
+        p["v"] = int(time.time())
+        p.pop("await", None)
+        api("sendMessage", {"chat_id": chat_id, "text": "✅ Готово, фото уже в приложении клуба (вкладка «Пилоты»)."})
+        notify_new_car(uid, user, p)
+    answer()
+
+
+def profile_photo_message(msg):
+    # Фото в личке бота: если человек сейчас ставит фото машины — показываем и спрашиваем «Ставим?»
+    uid = msg["from"]["id"]
+    p = profiles.get(uid, {})
+    if p.get("await") != "car":
+        reply(msg, "Чтобы поставить фото машины в профиль, набери /myprofile и нажми «🚗 Фото машины».")
+        return
+    p["pending"] = duel_image(msg)[0]
+    p.pop("await", None)
+    api("sendPhoto", {"chat_id": msg["chat"]["id"], "photo": p["pending"],
+                      "caption": "Ставим это фото? Напоминаю: машина должна быть в ливрее клуба KHR.",
+                      "reply_markup": {"inline_keyboard": [[{"text": "✅ Ставим", "callback_data": "pf:ok"},
+                                                            {"text": "🔄 Другое фото", "callback_data": "pf:again"}]]}})
+
+
+def profile_text_message(msg):
+    # Текст в личке бота, когда человек пишет «о себе». Возвращает True, если сообщение забрали.
+    p = profiles.get(msg["from"]["id"], {})
+    text = msg.get("text", "").strip()
+    if p.get("await") != "about" or text.startswith("/"):
+        p.pop("await", None) if text.startswith("/") else None
+        return False
+    p.pop("await", None)
+    if text == "-":
+        p.pop("about", None)
+        reply(msg, "Подпись убрана.")
+    else:
+        p["about"] = text[:ABOUT_MAX]
+        reply(msg, "✅ Подпись сохранена" + (f" (обрезал до {ABOUT_MAX} символов)" if len(text) > ABOUT_MAX else "")
+              + ". Посмотреть: /myprofile → «👁 Мой профиль».")
+    return True
+
+
+def photo_remove_callback(cq):
+    _, uid, v = cq["data"].split(":")
+    uid, v = int(uid), int(v)
+    clicker = cq["from"]
+    chat_id = club_chat()
+    answer = lambda text, alert=False: api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": text,
+                                                                   "show_alert": alert})
+    if not chat_id or get_level(chat_id, clicker["id"]) < 2:
+        answer("Убирать фото могут только администраторы.", True)
+        return
+    p = profiles.get(uid, {})
+    msg = cq.get("message") or {}
+    if p.get("v") != v or not p.get("car"):
+        answer("Это фото уже заменили или убрали.")
+        return
+    p.pop("car", None)
+    api("editMessageCaption", {"chat_id": msg.get("chat", {}).get("id"), "message_id": msg.get("message_id"),
+                               "caption": (msg.get("caption") or "") + f"\n\n❌ Убрано ({name_of(clicker)})",
+                               "reply_markup": {"inline_keyboard": []}})
+    api("sendMessage", {"chat_id": uid, "text": "Администратор убрал фото твоей машины из профиля.\n"
+                                                "Поставь фото машины в ливрее клуба KHR: /myprofile"})
+    answer("Фото убрано")
+
+
+def profile_photo(username):
+    # Байты фото машины для сайта. Токен бота наружу не попадает: сайт берёт фото у бота, а не у Телеграма.
+    uname = (username or "").lower().lstrip("@")
+    p = next((p for p in profiles.values() if (p.get("username") or "").lower() == uname and p.get("car")), None)
+    if not p:
+        return None
+    cached = _photo_cache.get(uname)
+    if cached and cached[0] == p["car"]:
+        return cached[1]
+    data = tg_file(p["car"])
+    if data:
+        _photo_cache[uname] = (p["car"], data)
+        while len(_photo_cache) > 80:
+            _photo_cache.pop(next(iter(_photo_cache)))
+    return data
+
+
 DM_TEST_TEXT = ("✅ Тест: бот может писать вам в ЛС.\n"
                 "Сюда по понедельникам будет приходить список не выполнивших норму с кнопками варна, "
                 "а также сигналы о возможной накрутке дуэлей.")
@@ -1734,6 +1933,7 @@ HELP_TEXT = """📖 Команды бота
 /warns — свои предупреждения (ответом — чужие)
 /report причина — ответом на сообщение: позвать модерацию
 /norm (или «норма») — твои дуэли за неделю; /norm all — все; ответом — чужие
+/myprofile — в ЛС бота: фото своей машины (обязательно в ливрее клуба) и подпись для приложения
 /app — кнопка с таблицами клуба
 
 📸 Дуэли: кидай скрины «История заездов» в тему отчётов — бот сам посчитает
@@ -1849,12 +2049,21 @@ def handle(msg):
     if is_group and "from" in msg and is_duel_report(msg):
         handle_duel_report(msg)
         return
+    if not is_group and "from" in msg and duel_image(msg)[0]:
+        profile_photo_message(msg)
+        return
 
     text = msg.get("text", "")
     if not text or "from" not in msg:
         return
+    if not is_group and profile_text_message(msg):
+        return
     lower = text.lower()
     cmd, args, is_word = parse_command(text)
+
+    if cmd == "myprofile" or (cmd == "start" and not is_group and args[:1] == ["profile"]):
+        myprofile(msg)
+        return
 
     if cmd in ADMIN_CMDS:
         if is_group:
@@ -1878,7 +2087,8 @@ def handle(msg):
             private_dmtest(msg, args)
             return
         if cmd == "start":
-            send(chat_id, "Привет! Нажми кнопку ниже, чтобы открыть таблицы клуба.")
+            send(chat_id, "Привет! Нажми кнопку ниже, чтобы открыть таблицы клуба.\n"
+                          "Оформить свой профиль (фото машины в ливрее клуба): /myprofile")
         return
 
     if cmd == "roster":
@@ -1925,6 +2135,23 @@ class Handler(BaseHTTPRequestHandler):
             save_state()
 
     def do_GET(self):
+        if self.path.startswith("/photo/"):
+            # Фото машины пилота для приложения: /photo/<@ник>?v=<версия>
+            name = self.path[len("/photo/"):].split("?")[0]
+            try:
+                data = profile_photo(unquote(name))
+            except Exception as e:
+                print("Ошибка /photo:", repr(e))
+                data = None
+            self.send_response(200 if data else 404)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            if data:
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            if data:
+                self.wfile.write(data)
+            return
         if self.path.startswith("/duels"):
             # Дуэли для мини-приложения (вкладка «Пилоты»): по @нику — сколько за эту и прошлую неделю
             try:
@@ -1953,7 +2180,8 @@ PUBLIC_MENU = [
     ("team", "Состав по должностям"), ("staff", "Модераторы и админы"), ("rules", "Правила чата"),
     ("warns", "Предупреждения"), ("report", "Позвать модерацию (ответом)"),
     ("norm", "Норма дуэлей за неделю"), ("normall", "Норма дуэлей у всех"),
-    ("recheck", "Перечитать скрин (ответом)"), ("app", "Таблицы клуба"),
+    ("recheck", "Перечитать скрин (ответом)"), ("myprofile", "Мой профиль: фото машины в ливрее клуба"),
+    ("app", "Таблицы клуба"),
 ]
 ADMIN_MENU = PUBLIC_MENU + [
     ("warn", "Предупреждение"), ("mute", "Мут: /mute 30m причина"), ("unmute", "Снять мут"),
