@@ -130,7 +130,11 @@ def load_state():
 def save_state():
     if not DB_OK:
         return
-    db_save({
+    db_save(state_dict())
+
+
+def state_dict():
+    return ({
         "members": str_keys(members),
         "stats": str_keys(stats),
         "staff": str_keys(staff),
@@ -1069,9 +1073,33 @@ def is_duel_report(msg):
     return msg.get("message_thread_id", 0) == conf["duel_thread"] and duel_image(msg)[0] is not None
 
 
-def add_duels(chat_id, uid, opponent, rows, group, items=None):
+def game_name(chat_id, uid):
+    # Ник в игре — колонка «Имя» в таблице пилотов, ищем по @нику в Телеграме
+    uname = members.get(chat_id, {}).get(uid, {}).get("username") or ""
+    r = find_pilot(uname) if uname else None
+    return col(r, 1) if r else ""
+
+
+def uid_by_game_name(chat_id, name):
+    for r in get_pilots():
+        if col(r, 1).lower() == name.lower():
+            tgname = col(r, 2).lower().lstrip("@")
+            for u in members.get(chat_id, {}).values():
+                if (u.get("username") or "").lower() == tgname:
+                    return u["id"]
+    return None
+
+
+def mirror(score):
+    parts = score.split(" / ")
+    return f"{parts[1]} / {parts[0]}" if len(parts) == 2 else score
+
+
+def add_duels(chat_id, uid, opponent, rows, group, items=None, alerts=None):
     # Возвращает (новых, повторов, вне срока). В items дописывает каждую строку скрина с её судьбой,
     # чтобы бот показал в ответе, что именно прочитал и куда засчитал.
+    # Дуэль «подтверждена», если соперник из клуба тоже сдал её. В alerts — подозрение на накрутку:
+    # другой участник уже сдал те же дуэли с тем же соперником (значит, это один и тот же скрин).
     items = [] if items is None else items
     mine = duels.setdefault(chat_id, {}).setdefault(uid, [])
     have = {(d["d"], d["o"].lower(), d["s"]) for d in mine}
@@ -1079,6 +1107,8 @@ def add_duels(chat_id, uid, opponent, rows, group, items=None):
     oldest = today - datetime.timedelta(days=DUEL_KEEP_DAYS)
     added = dup = skip = 0
     opp = re.sub(r"^\s*vs\.?\s*", "", opponent or "", flags=re.I).strip() or "?"
+    opp_uid, my_name = uid_by_game_name(chat_id, opp), game_name(chat_id, uid)
+    same = {}  # другой участник → сколько точно таких же дуэлей он уже сдал
     for row in rows:
         score, res = norm_score(row.get("score")), row.get("result", "")
         try:
@@ -1097,11 +1127,24 @@ def add_duels(chat_id, uid, opponent, rows, group, items=None):
             items.append((day, opp, res, score, "dup"))
             continue
         have.add(key)
-        mine.append({"d": key[0], "o": opp, "r": res, "s": score,
-                     "t": (row.get("track") or "")[:40], "g": group})
+        rec = {"d": key[0], "o": opp, "r": res, "s": score, "t": (row.get("track") or "")[:40], "g": group}
+        if opp_uid and opp_uid != uid and my_name:
+            for d in duels[chat_id].get(opp_uid, []):
+                if d["d"] == rec["d"] and d["o"].lower() == my_name.lower() and d["s"] in (score, mirror(score)):
+                    d["c"] = rec["c"] = 1
+        for other, lst in duels[chat_id].items():
+            if other != uid and any(d["d"] == rec["d"] and d["o"].lower() == opp.lower() and d["s"] == score for d in lst):
+                same[other] = same.get(other, 0) + 1
+        mine.append(rec)
         added += 1
-        items.append((day, opp, res, score, "new"))
+        items.append((day, opp, res, score, "new", rec.get("c")))
     mine.sort(key=lambda d: d["d"])
+    if alerts is not None:
+        # Одна совпавшая дуэль «100 / 100» бывает и честно, поэтому шумим от двух совпадений
+        # или когда совпал весь скрин
+        for other, n in same.items():
+            if n >= 2 or n == len(rows):
+                alerts.append((other, opp, n))
     return added, dup, skip
 
 
@@ -1128,11 +1171,13 @@ def duel_report_text(chat_id, user, s):
     if items:
         # Каждая прочитанная дуэль и куда она пошла: так видно, почему «за неделю» меньше, чем на скрине
         lines.append("")
-        for day, opp, res, score, status in items[:25]:
+        for day, opp, res, score, status, *extra in items[:25]:
             when = f"{day:%d.%m}" if day else "без даты"
             if status == "new":
                 ws, we = week_bounds(day)
                 where = "эта неделя" if ws == start else f"неделя {week_label(ws, we)}"
+                if extra and extra[0]:
+                    where += " ✔ подтверждена соперником"
             else:
                 where = {"dup": "уже засчитана раньше", "skip": "вне срока"}[status]
             lines.append(f"{when} vs {opp} — {RESULT_RU.get(res, res)} ({score}) → {where}")
@@ -1203,11 +1248,22 @@ def apply_duel(msg, res, err):
     elif not res.get("is_duel_history") or not res.get("rows"):
         s["bad"] += 1
     else:
-        a, d, k = add_duels(chat_id, user["id"], res.get("opponent"), res["rows"], group, s["items"])
+        alerts = []
+        a, d, k = add_duels(chat_id, user["id"], res.get("opponent"), res["rows"], group, s["items"], alerts)
         s["added"] += a
         s["dup"] += d
         s["skip"] += k
         print(f"Дуэли {name_of(user)}: {res.get('opponent')} +{a}, повторов {d}, вне срока {k}")
+        for other, opp, n in alerts:
+            o = members.get(chat_id, {}).get(other, {"first_name": str(other)})
+            who = name_of(user) + (f" @{user['username']}" if user.get("username") else "")
+            cid = str(chat_id)[4:] if str(chat_id).startswith("-100") else ""
+            link = (f"\nСкрин: https://t.me/c/{cid}/" + (f"{msg['message_thread_id']}/" if msg.get("message_thread_id") else "")
+                    + str(msg["message_id"])) if cid else ""
+            print(f"Подозрение на накрутку: {who} и {name_of(o)}, vs {opp}, совпало {n}")
+            dm_admins(chat_id, f"🚩 Возможная накрутка: {who} сдал(а) дуэли vs {opp}, которые уже сдал(а) "
+                               f"{name_of(o)} — совпало {n} шт. (та же дата, тот же соперник, тот же счёт). "
+                               f"Похоже на один и тот же скрин.{link}\nЕсли это так — отмени отчёт кнопкой под ответом бота.")
 
     text = duel_report_text(chat_id, user, s)
     markup = {"inline_keyboard": [[{"text": "❌ Отменить этот отчёт", "callback_data": f"du:{user['id']}:{group}"}]]}
@@ -1227,6 +1283,9 @@ def apply_duel(msg, res, err):
 
 def handle_callback(cq):
     data = cq.get("data", "")
+    if data.startswith("nw:"):
+        norm_warn_callback(cq)
+        return
     msg = cq.get("message") or {}
     chat_id = (msg.get("chat") or {}).get("id")
     if not data.startswith("du:") or not chat_id:
@@ -1383,7 +1442,7 @@ def sheet_payload(chat_id):
             day = datetime.date.fromisoformat(d["d"])
             duel_rows.append([week_label(*week_bounds(day)), day.strftime("%d.%m.%Y"), u.get("first_name", str(uid)),
                               "@" + u["username"] if u.get("username") else "", d["o"],
-                              RESULT_RU.get(d["r"], d["r"]), d["s"], d.get("t", "")])
+                              RESULT_RU.get(d["r"], d["r"]), d["s"], d.get("t", ""), "✔" if d.get("c") else ""])
     duel_rows.sort(key=lambda r: (r[1][6:] + r[1][3:5] + r[1][:2], r[2]), reverse=True)
     norm = get_norm(chat_id)
     weeks = [week_bounds(back=i) for i in range(4)]
@@ -1394,7 +1453,8 @@ def sheet_payload(chat_id):
                           "✅" if counts[0] >= norm else f"осталось {norm - counts[0]}"] + counts[1:])
     norm_rows.sort(key=lambda r: -r[2])
     return {
-        "duels_head": ["Неделя", "Дата", "Пилот", "Телеграм", "Соперник", "Результат", "Счёт", "Трасса"],
+        "duels_head": ["Неделя", "Дата", "Пилот", "Телеграм", "Соперник", "Результат", "Счёт", "Трасса",
+                       "Подтверждена соперником"],
         "duels": duel_rows,
         "norm_head": ["Пилот", "Телеграм", f"Эта неделя {week_label(*weeks[0])}", "Норма", "Статус"]
                      + [week_label(*w) for w in weeks[1:]],
@@ -1419,6 +1479,181 @@ def sync_sheet(chat_id):
             print(f"Ошибка выгрузки в таблицу: HTTP {r.status_code} {r.text[:200]}")
     except Exception as e:
         print("Ошибка выгрузки в таблицу:", e)
+
+
+# ---------- Автоматика: напоминания, итоги недели, сообщения админам, резервная копия ----------
+REMIND_DAY, REMIND_HOUR = 4, 18    # пятница 18:00 МСК — напоминание тем, у кого меньше половины нормы
+SUMMARY_DAY, SUMMARY_HOUR = 0, 10  # понедельник 10:00 МСК — итоги прошлой недели
+_auto = {"ping": 0, "backup": 0}
+
+
+def msk_now():
+    return datetime.datetime.utcnow() + datetime.timedelta(hours=3)
+
+
+def admin_ids(chat_id):
+    ids = {m["user"]["id"] for m in get_admins(chat_id)}
+    ids |= {uid for uid, lvl in staff.get(chat_id, {}).items() if lvl >= 2}
+    return ids
+
+
+def dm_admins(chat_id, text, markup=None):
+    # Писать в ЛС бот может только тем, кто хоть раз открыл его и нажал Start
+    sent = 0
+    for uid in admin_ids(chat_id):
+        payload = {"chat_id": uid, "text": text}
+        if markup:
+            payload["reply_markup"] = markup
+        if api("sendMessage", payload).get("ok"):
+            sent += 1
+        else:
+            print(f"Не смог написать админу {uid} в ЛС: пусть откроет @{BOT_USERNAME} и нажмёт Start")
+    return sent
+
+
+def post_to_reports(chat_id, text):
+    payload = {"chat_id": chat_id, "text": text}
+    if settings.get(chat_id, {}).get("duel_thread"):
+        payload["message_thread_id"] = settings[chat_id]["duel_thread"]
+    api("sendMessage", payload)
+
+
+def mention(p):
+    return f"@{p['tg']}" if p["tg"] else p["name"]
+
+
+def norm_rows(chat_id, start, end):
+    return [(duels_in(chat_id, p["uid"], start, end) if p["uid"] else 0, p) for p in duel_people(chat_id)]
+
+
+def friday_reminder(chat_id, now):
+    start, end = week_bounds(now.date())
+    norm = get_norm(chat_id)
+    behind = sorted([(n, p) for n, p in norm_rows(chat_id, start, end) if n < norm / 2], key=lambda x: x[0])
+    if not behind:
+        return
+    left = (end - now.date()).days + 1
+    post_to_reports(chat_id, f"⏰ До конца недели {week_label(start, end)} осталось {left} дн. Норма — {norm} дуэлей.\n"
+                             "Пока меньше половины:\n" + "\n".join(f"{mention(p)} — {n}/{norm}" for n, p in behind)
+                    + "\n\nСкрины «История заездов» кидайте сюда.")
+
+
+def monday_summary(chat_id, now):
+    start, end = week_bounds(now.date(), back=1)
+    norm = get_norm(chat_id)
+    rows = sorted(norm_rows(chat_id, start, end), key=lambda x: -x[0])
+    done = [(n, p) for n, p in rows if n >= norm]
+    fail = [(n, p) for n, p in rows if n < norm]
+    text = f"🏁 Итоги недели {week_label(start, end)}: норму ({norm}) выполнили {len(done)} из {len(rows)}"
+    if done:
+        text += "\n\n" + "\n".join(f"✅ {p['name']} — {n}" for n, p in done)
+    if fail:
+        text += "\n\n" + "\n".join(f"❌ {p['name']} — {n}/{norm}" for n, p in fail)
+    post_to_reports(chat_id, text)
+    if not fail:
+        return
+    # Варны не выдаём сами: админ решает, у кого уважительная причина
+    buttons = [[{"text": f"⚠️ Варн: {p['name']} ({n}/{norm})",
+                 "callback_data": f"nw:{chat_id}:{p['uid']}:{start.isoformat()}"}] for n, p in fail if p["uid"]][:50]
+    unknown = [p["name"] for n, p in fail if not p["uid"]]
+    msg = (f"📋 Не выполнили норму за неделю {week_label(start, end)}: {len(fail)}.\n"
+           "Правило: нет нормы — варн, кроме уважительных причин. Нажми на тех, кому выдать варн.")
+    if unknown:
+        msg += "\n\nЭтих бот не знает в чате, варн только вручную: " + ", ".join(unknown)
+    dm_admins(chat_id, msg, {"inline_keyboard": buttons})
+
+
+def norm_warn_callback(cq):
+    _, chat_id, uid, week = cq["data"].split(":")
+    chat_id, uid = int(chat_id), int(uid)
+    clicker = cq["from"]
+    answer = lambda text, alert=False: api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": text,
+                                                                   "show_alert": alert})
+    if get_level(chat_id, clicker["id"]) < 2:
+        answer("Выдавать варны за норму могут только администраторы.", True)
+        return
+    warned = settings.setdefault(chat_id, {}).setdefault("norm_warned", {})
+    done = warned.setdefault(week, [])
+    for old in sorted(warned)[:-8]:  # храним отметки только за последние недели
+        del warned[old]
+    msg = cq.get("message") or {}
+    if msg.get("reply_markup"):
+        keep = [row for row in msg["reply_markup"].get("inline_keyboard", []) if row[0].get("callback_data") != cq["data"]]
+        api("editMessageReplyMarkup", {"chat_id": msg["chat"]["id"], "message_id": msg["message_id"],
+                                       "reply_markup": {"inline_keyboard": keep}})
+    if uid in done:
+        answer("Этому участнику варн за эту неделю уже выдан.")
+        return
+    done.append(uid)
+    target = members.get(chat_id, {}).get(uid, {"id": uid, "first_name": str(uid)})
+    reason = f"норма дуэлей за неделю {week_label(*week_bounds(datetime.date.fromisoformat(week)))}"
+    fake = {"chat": {"id": chat_id}, "from": clicker}
+    key = (chat_id, uid)
+    warns[key] = warns.get(key, 0) + 1
+    record_action(chat_id, uid, name_of(target), "warn")
+    log_action(fake, target, "варн", reason)
+    text = f"⚠️ {name_of(target)}, предупреждение {warns[key]} из {WARN_LIMIT}. Причина: {reason}"
+    if warns[key] >= WARN_LIMIT and api("banChatMember", {"chat_id": chat_id, "user_id": uid}).get("ok"):
+        warns[key] = 0
+        record_action(chat_id, uid, name_of(target), "ban")
+        members.get(chat_id, {}).pop(uid, None)
+        log_action(fake, target, "автобан", f"{WARN_LIMIT} варна")
+        text = f"⚠️ {name_of(target)}: {WARN_LIMIT} предупреждения, автобан. Причина: {reason}"
+    post_to_reports(chat_id, text)
+    answer(f"Варн выдан: {name_of(target)}")
+
+
+def backup_state(now):
+    # Копия всей базы в отдельную строку bot_state: backup_mon … backup_sun, то есть хранится неделя копий
+    try:
+        r = requests.post(f"{SB_URL}/rest/v1/bot_state", headers=dict(SB_HEADERS, Prefer="resolution=merge-duplicates"),
+                          json={"id": "backup_" + now.strftime("%a").lower(), "data": state_dict()}, timeout=20)
+        if r.status_code >= 300:
+            print(f"Ошибка резервной копии: HTTP {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        print("Ошибка резервной копии:", e)
+
+
+def scheduler_tick(now):
+    url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if url and time.time() - _auto["ping"] > 600:
+        # Бесплатный Render усыпляет бота после 15 минут тишины. Стучимся к себе сами, чтобы он не спал.
+        _auto["ping"] = time.time()
+        try:
+            requests.get(url + "/", timeout=20)
+        except Exception as e:
+            print("Самопинг не прошёл:", e)
+    with LOCK:
+        load_state()
+        if not DB_OK:
+            return
+        week = week_bounds(now.date())[0].isoformat()
+        changed = False
+        for chat_id, conf in list(settings.items()):
+            if "duel_thread" not in conf:
+                continue
+            if now.weekday() == REMIND_DAY and now.hour >= REMIND_HOUR and conf.get("reminded") != week:
+                conf["reminded"] = week
+                friday_reminder(chat_id, now)
+                changed = True
+            if now.weekday() == SUMMARY_DAY and now.hour >= SUMMARY_HOUR and conf.get("summarized") != week:
+                conf["summarized"] = week
+                monday_summary(chat_id, now)
+                changed = True
+        if changed:
+            save_state()
+        if time.time() - _auto["backup"] > 6 * 3600:
+            _auto["backup"] = time.time()
+            backup_state(now)
+
+
+def scheduler_loop():
+    while True:
+        try:
+            scheduler_tick(msk_now())
+        except Exception as e:
+            print("Ошибка планировщика:", repr(e))
+        time.sleep(300)
 
 
 HELP_TEXT = """📖 Команды бота
@@ -1464,6 +1699,10 @@ HELP_TEXT = """📖 Команды бота
 /welcome on|off — включить или выключить приветствие
 /duelhere — написать в теме отчётов: бот начнёт считать там дуэли (off — выключить)
 /setnorm 20 — норма дуэлей в неделю
+
+🤖 Сам бот: в пятницу 18:00 напоминает тем, у кого меньше половины нормы, в понедельник 10:00 подводит
+итоги недели. Админам в ЛС приходит список не выполнивших норму с кнопками варна и сигналы о возможной
+накрутке. Чтобы получать ЛС, открой бота и нажми Start.
 
 Цель команды — ответ на сообщение, @ник или упоминание.
 Модерация понимает и слова без слэша: бан, мут, кик, варн, пред, разбан, размут, разварн.
@@ -1687,6 +1926,7 @@ if __name__ == "__main__":
     setup_webhook()
     DUEL_ASYNC = True
     threading.Thread(target=duel_worker, daemon=True).start()
+    threading.Thread(target=scheduler_loop, daemon=True).start()
     if SHEET_HOOK:
         # При запуске сразу обновляем таблицу «KHR — дуэли», не дожидаясь нового отчёта
         threading.Thread(target=lambda: [sync_sheet(c) for c in list(duels)], daemon=True).start()
