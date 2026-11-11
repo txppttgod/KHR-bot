@@ -39,6 +39,10 @@ MODLOG_SIZE = 50        # сколько последних действий м�
 MAX_ROLES = 5           # сколько должностей можно дать одному человеку
 DUEL_NORM_DEFAULT = 20  # норма дуэлей в неделю, меняется командой /setnorm
 DUEL_KEEP_DAYS = 70     # сколько дней хранить дуэли
+# Защита от «пустых» заездов: если соперник проехал лидером на 0, игра сама даёт преследователю 100 баллов.
+# Поэтому дуэль идёт в норму пилоту, только если у него самого не меньше 100.1 балла.
+MIN_SCORE = 100.1
+CLUB_ONLY = True        # в норму идут только дуэли с соперником из таблицы пилотов клуба
 PERM_KEYS = [
     "can_send_messages", "can_send_audios", "can_send_documents", "can_send_photos",
     "can_send_videos", "can_send_video_notes", "can_send_voice_notes", "can_send_polls",
@@ -945,9 +949,31 @@ def get_norm(chat_id):
     return settings.get(chat_id, {}).get("norm", DUEL_NORM_DEFAULT)
 
 
+def own_score(s):
+    # Счёт хранится «свои / соперника»: первое число — баллы самого пилота
+    nums = re.findall(r"\d+(?:\.\d+)?", s or "")
+    return float(nums[0]) if nums else 0.0
+
+
+def club_names():
+    return {col(r, 1).strip().lower() for r in get_pilots() if col(r, 1) != "—"}
+
+
+def why_not_counted(d, names=None):
+    # Почему дуэль не идёт в норму этому пилоту ("" — идёт). Проверяется при каждом подсчёте,
+    # поэтому правила действуют и для уже сданных дуэлей.
+    if own_score(d["s"]) < MIN_SCORE:
+        return f"меньше {MIN_SCORE:g} балла"
+    names = club_names() if names is None else names
+    if CLUB_ONLY and names and d["o"].strip().lower() not in names:
+        return "соперник не из клуба"
+    return ""
+
+
 def duels_in(chat_id, uid, start, end):
     a, b = start.isoformat(), end.isoformat()
-    return sum(1 for d in duels.get(chat_id, {}).get(uid, []) if a <= d["d"] <= b)
+    names = club_names()
+    return sum(1 for d in duels.get(chat_id, {}).get(uid, []) if a <= d["d"] <= b and not why_not_counted(d, names))
 
 
 def norm_score(s):
@@ -1117,6 +1143,7 @@ def add_duels(chat_id, uid, opponent, rows, group, items=None, alerts=None):
     added = dup = skip = 0
     opp = re.sub(r"^\s*vs\.?\s*", "", opponent or "", flags=re.I).strip() or "?"
     opp_uid, my_name = uid_by_game_name(chat_id, opp), game_name(chat_id, uid)
+    names = club_names()
     same = {}  # другой участник → сколько точно таких же дуэлей он уже сдал
     for row in rows:
         score, res = norm_score(row.get("score")), row.get("result", "")
@@ -1148,7 +1175,7 @@ def add_duels(chat_id, uid, opponent, rows, group, items=None, alerts=None):
         have.add(key)
         have.add((key[0], key[1], mirror(score)))
         rec = {"d": key[0], "o": opp, "r": res, "s": score, "t": (row.get("track") or "")[:40], "g": group}
-        credited = False
+        credited = False  # "" — сопернику не писали, "ok" — засчитана и ему, иначе причина, почему ему не в норму
         if opp_uid and opp_uid != uid and my_name:
             theirs = duels[chat_id].setdefault(opp_uid, [])
             old = [d for d in theirs if d["d"] == rec["d"] and d["o"].lower() == my_name.lower()
@@ -1158,17 +1185,20 @@ def add_duels(chat_id, uid, opponent, rows, group, items=None, alerts=None):
                     d["c"] = 1
                 rec["c"] = 1
             else:
-                theirs.append({"d": rec["d"], "o": my_name, "r": OPPOSITE.get(res, res), "s": mirror(score),
-                               "t": rec["t"], "g": group, "by": uid})
+                theirs_rec = {"d": rec["d"], "o": my_name, "r": OPPOSITE.get(res, res), "s": mirror(score),
+                              "t": rec["t"], "g": group, "by": uid}
+                theirs.append(theirs_rec)
                 theirs.sort(key=lambda d: d["d"])
-                credited = True
+                credited = why_not_counted(theirs_rec, names) or "ok"
         for other, lst in duels[chat_id].items():
             if other not in (uid, opp_uid) and any(d["d"] == rec["d"] and d["o"].lower() == opp.lower()
                                                    and d["s"] == score for d in lst):
                 same[other] = same.get(other, 0) + 1
         mine.append(rec)
-        added += 1
-        items.append((day, opp, res, score, "new", rec.get("c"), credited))
+        reason = why_not_counted(rec, names)
+        if not reason:
+            added += 1
+        items.append((day, opp, res, score, "new", rec.get("c"), credited, reason))
     mine.sort(key=lambda d: d["d"])
     if alerts is not None:
         # Одна совпавшая дуэль «100 / 100» бывает и честно, поэтому шумим от двух совпадений
@@ -1192,6 +1222,9 @@ def duel_report_text(chat_id, user, s):
     who = name_of(user) + (f" (@{user['username']})" if user.get("username") else "")
     lines = [f"📸 Отчёт по дуэлям: {who}", f"Засчитано новых дуэлей: {s['added']}"]
     extra = []
+    nocount = sum(1 for it in s.get("items", []) if it[4] == "new" and len(it) > 7 and it[7])
+    if nocount:
+        extra.append(f"не в норму: {nocount} (меньше {MIN_SCORE:g} балла или соперник не из клуба)")
     if s["dup"]:
         extra.append(f"повторы (уже были): {s['dup']}")
     if s["skip"]:
@@ -1205,12 +1238,16 @@ def duel_report_text(chat_id, user, s):
         for day, opp, res, score, status, *extra in items[:25]:
             when = f"{day:%d.%m}" if day else "без даты"
             if status == "new":
-                ws, we = week_bounds(day)
-                where = "эта неделя" if ws == start else f"неделя {week_label(ws, we)}"
-                if extra and extra[0]:
-                    where += " ✔ подтверждена соперником"
-                if len(extra) > 1 and extra[1]:
-                    where += " · засчитана и сопернику"
+                confirmed, credited, reason = (list(extra) + [None, None, ""])[:3]
+                if reason:
+                    where = f"не в норму: {reason}"
+                else:
+                    ws, we = week_bounds(day)
+                    where = "эта неделя" if ws == start else f"неделя {week_label(ws, we)}"
+                    if confirmed:
+                        where += " ✔ подтверждена соперником"
+                if credited:
+                    where += " · засчитана и сопернику" if credited == "ok" else f" · сопернику не в норму: {credited}"
             else:
                 where = {"dup": "уже засчитана раньше", "skip": "вне срока",
                          "conf": "уже засчитана по отчёту соперника ✔ подтверждена"}[status]
@@ -1413,6 +1450,7 @@ def reply_norm(msg, args):
     if recent:
         text += "\n\nПоследние за неделю:\n" + "\n".join(
             f"{datetime.date.fromisoformat(d['d']):%d.%m} vs {d['o']} — {RESULT_RU.get(d['r'], d['r'])} ({d['s']})"
+            + (f" ✗ не в норму: {why_not_counted(d)}" if why_not_counted(d) else "")
             for d in recent)
     reply(msg, text)
 
@@ -1484,6 +1522,7 @@ def duels_json():
 
 def sheet_payload(chat_id):
     names = {u["id"]: u for u in members.get(chat_id, {}).values()}
+    names_ = club_names()
     duel_rows = []
     for uid, lst in duels.get(chat_id, {}).items():
         u = names.get(uid, {})
@@ -1492,6 +1531,7 @@ def sheet_payload(chat_id):
             duel_rows.append([week_label(*week_bounds(day)), day.strftime("%d.%m.%Y"), u.get("first_name", str(uid)),
                               "@" + u["username"] if u.get("username") else "", d["o"],
                               RESULT_RU.get(d["r"], d["r"]), d["s"], d.get("t", ""),
+                              ("не в норму: " + why_not_counted(d, names_)) if why_not_counted(d, names_) else
                               "✔ сдали оба" if d.get("c") else "по отчёту соперника" if d.get("by") else ""])
     duel_rows.sort(key=lambda r: (r[1][6:] + r[1][3:5] + r[1][:2], r[2]), reverse=True)
     norm = get_norm(chat_id)
@@ -1939,6 +1979,8 @@ HELP_TEXT = """📖 Команды бота
 📸 Дуэли: кидай скрины «История заездов» в тему отчётов — бот сам посчитает
 дуэли за неделю (пн–вс), повторы со старых скринов не засчитываются.
 Дуэль с участником клуба засчитывается обоим с первого скрина — второму сдавать её не нужно.
+В норму идут только дуэли с участниками клуба и только если у тебя не меньше 100.1 балла
+(100 / 100 — это пустой заезд лидером на 0, такие не считаются).
 /recheck — ответом на свой скрин: перечитать, если ИИ не смог (модераторы — любой)
 
 🛡 Модератор (уровень 1+):
