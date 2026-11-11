@@ -1,0 +1,18 @@
+# Автопроверка: при каждом изменении в репозитории GitHub запускает тесты бота.
+# Если хоть одна проверка не прошла, коммит помечается красным крестиком.
+name: Тесты бота
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Проверки bot.py
+        run: python tests/test_bot.py
