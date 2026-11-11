@@ -1127,6 +1127,47 @@ def mirror(score):
     return f"{parts[1]} / {parts[0]}" if len(parts) == 2 else score
 
 
+def score_pair(s):
+    nums = re.findall(r"\d+(?:\.\d+)?", s or "")
+    return (float(nums[0]), float(nums[1])) if len(nums) >= 2 else None
+
+
+def same_duel(mine, day, opp, score, track, group):
+    # Защита от «дюпа»: скрин недоезженной дуэли (один проехал лид+чейз, другой пока только лид),
+    # а потом скрин той же дуэли целиком. Счёт разный, но одно из двух чисел не меняется —
+    # по нему, дате, сопернику и трассе узнаём ту же дуэль. 0 и 100 игра даёт автоматически,
+    # поэтому по ним не сравниваем. Строки с того же скрина — всегда разные дуэли.
+    new = score_pair(score)
+    if not new:
+        return None
+    for d in mine:
+        if d["d"] != day or d["o"].lower() != opp.lower() or d.get("g") == group:
+            continue
+        if track and d.get("t") and d["t"].lower() != track.lower():
+            continue
+        old = score_pair(d["s"])
+        if old and any(a == b and a not in (0.0, 100.0) for a, b in zip(old, new)):
+            return d
+    return None
+
+
+def update_duel(chat_id, uid, ex, res, score):
+    # Оставляем более полный вариант счёта (с большей суммой баллов) и правим копию у соперника
+    old, new = score_pair(ex["s"]), score_pair(score)
+    if old and sum(new) <= sum(old):
+        return
+    old_mirror = mirror(ex["s"])
+    for other, lst in duels.get(chat_id, {}).items():
+        if other == uid:
+            continue
+        for d in lst:
+            # Вторая половина той же дуэли: копия у соперника (by == uid) или его исходная запись (ex — копия)
+            if d.get("g") == ex.get("g") and d["d"] == ex["d"] and d["s"] == old_mirror \
+                    and (d.get("by") == uid or other == ex.get("by")):
+                d["s"], d["r"] = mirror(score), OPPOSITE.get(res, res)
+    ex["s"], ex["r"] = score, res
+
+
 def add_duels(chat_id, uid, opponent, rows, group, items=None, alerts=None):
     # Возвращает (новых, повторов, вне срока). В items дописывает каждую строку скрина с её судьбой,
     # чтобы бот показал в ответе, что именно прочитал и куда засчитал.
@@ -1171,6 +1212,13 @@ def add_duels(chat_id, uid, opponent, rows, group, items=None, alerts=None):
                 items.append((day, opp, res, score, "conf"))
             else:
                 items.append((day, opp, res, score, "dup"))
+            continue
+        ex = same_duel(mine, key[0], opp, score, (row.get("track") or "")[:40], group)
+        if ex:
+            # Та же дуэль, только тогда ещё не доезженная: обновляем счёт, второй раз не считаем
+            update_duel(chat_id, uid, ex, res, score)
+            dup += 1
+            items.append((day, opp, res, score, "upd"))
             continue
         have.add(key)
         have.add((key[0], key[1], mirror(score)))
@@ -1250,6 +1298,7 @@ def duel_report_text(chat_id, user, s):
                     where += " · засчитана и сопернику" if credited == "ok" else f" · сопернику не в норму: {credited}"
             else:
                 where = {"dup": "уже засчитана раньше", "skip": "вне срока",
+                         "upd": "та же дуэль, что уже сдана (тогда была не доезжена) — счёт обновлён, второй раз не считается",
                          "conf": "уже засчитана по отчёту соперника ✔ подтверждена"}[status]
             lines.append(f"{when} vs {opp} — {RESULT_RU.get(res, res)} ({score}) → {where}")
         if len(items) > 25:
