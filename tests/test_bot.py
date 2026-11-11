@@ -375,6 +375,32 @@ check("only club opponents", "соперник не из клуба" in said(r) 
 check("100.1 exactly counts", not bot.why_not_counted({"s": "100.1 / 0", "o": "Petya"}) and bot.why_not_counted({"s": "100.0 / 0", "o": "Petya"}), [])
 r = send(OWNER, "/norm"); check("norm shows why", "✗ не в норму" in said(r), r)
 check("sheet shows why", any(row[-1].startswith("не в норму") for row in bot.sheet_payload(CHAT)["duels"]), [])
+
+# ---------- «дюп»: скрин недоезженной дуэли, потом скрин той же дуэли целиком ----------
+bot.load_state(); own1, petya1 = bot.duels_in(CHAT, OWNER, *wk), bot.duels_in(CHAT, USER2, *wk)
+GEM["answer"] = {"is_duel_history": True, "opponent": "Petya",
+                 "rows": [{"date": iso(today), "result": "win", "score": "171.3 / 52.4", "track": "Ebisu West"}]}
+photo(OWNER)
+GEM["answer"] = {"is_duel_history": True, "opponent": "Petya",
+                 "rows": [{"date": iso(today), "result": "win", "score": "171.3 / 140.8", "track": "Ebisu West"}]}
+r = photo(OWNER); bot.load_state()
+check("partial then full duel counted once", "Засчитано новых дуэлей: 0" in said(r) and "счёт обновлён" in said(r)
+      and bot.duels_in(CHAT, OWNER, *wk) == own1 + 1 and bot.duels_in(CHAT, USER2, *wk) == petya1 + 1, r)
+check("score updated for both", any(d["s"] == "171.3 / 140.8" for d in bot.duels[CHAT][OWNER])
+      and any(d["s"] == "140.8 / 171.3" and d.get("by") == OWNER for d in bot.duels[CHAT][USER2]), [])
+GEM["answer"] = {"is_duel_history": True, "opponent": "Ernest",
+                 "rows": [{"date": iso(today), "result": "loss", "score": "140.8 / 171.3", "track": "Ebisu West"}]}
+r = photo(USER2); bot.load_state()
+check("opponent's full screen not counted again", "Засчитано новых дуэлей: 0" in said(r) and bot.duels_in(CHAT, USER2, *wk) == petya1 + 1, r)
+GEM["answer"] = {"is_duel_history": True, "opponent": "Petya",
+                 "rows": [{"date": iso(today), "result": "win", "score": "171.3 / 120.5", "track": "Springstone"}]}
+r = photo(OWNER); bot.load_state()
+check("different track is a different duel", "Засчитано новых дуэлей: 1" in said(r), r)
+GEM["answer"] = {"is_duel_history": True, "opponent": "Petya",
+                 "rows": [{"date": iso(today), "result": "win", "score": "130.2 / 100", "track": "Ebisu East"},
+                          {"date": iso(today), "result": "win", "score": "130.2 / 115.5", "track": "Ebisu East"}]}
+r = photo(OWNER)
+check("two rows of one screen stay separate", "Засчитано новых дуэлей: 2" in said(r), r)
 print("\n".join(checks))
 failed = sum(c.startswith("FAIL") for c in checks)
 print("FAILED:", failed, "of", len(checks))
