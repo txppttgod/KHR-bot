@@ -1687,4 +1687,7 @@ if __name__ == "__main__":
     setup_webhook()
     DUEL_ASYNC = True
     threading.Thread(target=duel_worker, daemon=True).start()
+    if SHEET_HOOK:
+        # При запуске сразу обновляем таблицу «KHR — дуэли», не дожидаясь нового отчёта
+        threading.Thread(target=lambda: [sync_sheet(c) for c in list(duels)], daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
