@@ -591,6 +591,154 @@ check("designer removed", "Снял" in said(r) and not any(d["tg"] == "ivan" fo
 CSV["text"] = "№,Имя,Телеграм\n1,Ernest,@ernest,0,,,Пилот\n2,Petya,@petya,0,,,Дизайнер ливрей\n"; bot._cache["time"] = 0
 check("designer by table role", bot.is_designer(u(USER2)) and not bot.is_designer(u(USER)), [])
 CSV["text"] = "№,Имя,Телеграм\n1,Ernest,@ernest,0,,,Пилот\n2,Petya,@petya,0,,,Пилот\n"; bot._cache["time"] = 0
+
+# ---------- мини-УТС: турниры без судей ----------
+CSV["text"] = ("№,Имя,Телеграм\n1,Ernest,@ernest,0,,,Пилот\n2,Petya,@petya,0,,,Пилот\n3,Ivan,@ivan,0,,,Пилот\n"
+               "4,Danya,@danya,0,,,Пилот\n5,Nik,@moxitowo,0,,,Пилот\n"); bot._cache["time"] = 0
+names[6] = ("Гость", "guest")
+bot.random.seed(7)
+gname = {OWNER: "Ernest", USER2: "Petya", USER: "Ivan", MOD: "Danya", ADMIN: "Nik"}
+def T(tid):
+    bot.load_state(); return bot.uts_all().get(tid)
+def M(tid, mid):
+    return next(m for m in T(tid)["matches"] if m["id"] == mid)
+def tick(dt_min):
+    calls.clear(); bot.load_state(); bot.uts_tick(time.time() + dt_min * 60); bot.save_state(); return list(calls)
+sc = [150.0]
+def shot(uid, opp, wins):
+    # Скрин «История заездов»: по строке на заезд, True — заезд выиграл тот, кто кидает скрин
+    rows = []
+    for w in wins:
+        sc[0] += 1.3
+        a, b = (round(sc[0] + 10, 1), round(sc[0], 1)) if w else (round(sc[0], 1), round(sc[0] + 10, 1))
+        rows.append({"date": iso(today), "result": "win" if w else "loss", "score": f"{a} / {b}"})
+    GEM["answer"] = {"is_duel_history": True, "opponent": gname[opp], "rows": rows}
+    return photo(uid)
+posts = lambda c: " || ".join(p.get("text", "") for m, p in c if m == "sendMessage" and p.get("chat_id") == CHAT)
+
+r = send(USER, "/uts"); check("uts in group points to DM", any("start=uts" in json.dumps(p.get("reply_markup", {})) for c2, p in r), r)
+c = dm(6, text="/uts"); check("uts only for table pilots", "пилоты из таблицы" in texts(c), [])
+c = dm(USER, text="/uts"); check("uts wizard", "Новый мини-УТС" in texts(c) and any(b["callback_data"] == "ut:d:ok" for b in btns(c)), [])
+c = tap(USER, "ut:d:size"); check("wizard size", any(m == "editMessageText" and "топ-8" in p["text"] for m, p in c), [])
+tap(USER, "ut:d:size"); tap(USER, "ut:d:size"); c = tap(USER, "ut:d:size")
+check("wizard size cycles", any(m == "editMessageText" and "Размер: топ-4" in p["text"] for m, p in c), [])
+tap(USER, "ut:d:title"); c = dm(USER, text="Ночной УТС"); check("wizard title", "Название: Ночной УТС" in texts(c), [])
+tap(USER, "ut:d:time"); c = dm(USER, text="25:00"); check("wizard bad time", "Не понял время" in texts(c), [])
+c = dm(USER, text="23:30"); check("wizard own time", "Старт: в 23:30 МСК" in texts(c), [])
+c = tap(USER, "ut:d:start"); check("wizard start back to now", any(m == "editMessageText" and "как наберёмся" in p["text"] for m, p in c), [])
+c = tap(USER, "ut:d:ok")
+ann = [p for m, p in c if m == "sendMessage" and p.get("chat_id") == CHAT]
+check("tournament announced in chat", ann and "Ночной УТС" in ann[0]["text"] and ann[0].get("message_thread_id") == 83379
+      and any(b["callback_data"].startswith("ut:j:") for b in btns([("x", ann[0])])) and "1. Ivan" in ann[0]["text"], [("sendMessage", a) for a in ann])
+bot.load_state(); tid = next(iter(bot.uts_all()))
+check("creator registered", T(tid)["players"] == [USER] and T(tid)["state"] == "reg", [])
+c = tap(OWNER, f"ut:j:{tid}"); check("join", "Ты в турнире" in texts(c) and any(m == "editMessageText" and "2. Ernest" in p["text"] for m, p in c), [])
+c = tap(OWNER, f"ut:j:{tid}"); check("join twice", "уже записан" in texts(c), [])
+c = tap(6, f"ut:j:{tid}"); check("guest cannot join", "только пилоты из таблицы" in texts(c), [])
+tap(USER2, f"ut:j:{tid}"); c = tap(USER2, f"ut:x:{tid}"); check("leave", "вышел" in texts(c) and USER2 not in T(tid)["players"], [])
+c = dm(OWNER, text="/uts"); check("one tournament at a time", "уже в турнире" in texts(c), [])
+c = tap(ADMIN, f"ut:e:{tid}"); check("admin can edit too", "Изменение турнира" in texts(c), [])
+dm(ADMIN, text="/myprofile")  # закрыли чужое окно настроек — не мешает
+c = tap(MOD, f"ut:e:{tid}"); check("only organizer edits", any(p.get("show_alert") for m, p in c if m == "answerCallbackQuery"), [])
+res = bot.uts_api(init_for(USER2), tid, "join"); bot.save_state()
+check("join from app", res["ok"] and USER2 in T(tid)["players"], [("sendMessage", {"text": str(res)})])
+check("fake app join rejected", not bot.uts_api(init_for(USER2, bad=True), tid, "join")["ok"], [])
+c = tap(MOD, f"ut:j:{tid}")
+t = T(tid)
+check("full tournament starts", t["state"] == "run" and "стартует" in posts(c) and "⚔️" in posts(c), [(m, p) for m, p in c if m == "sendMessage"])
+check("double elimination bracket for 4", sorted(m["id"] for m in t["matches"]) == ["GF", "L1-1", "L2-1", "U1-1", "U1-2", "U2-1"]
+      and M(tid, "GF")["bo"] == 3, [("sendMessage", {"text": str([m["id"] for m in t["matches"]])})])
+m1 = M(tid, "U1-1"); m2 = M(tid, "U1-2")
+norm0 = bot.duels_in(CHAT, m1["pa"], *wk)
+c = shot(m1["pa"], m1["pb"], [True]); bot.load_state()
+check("screenshot decides match by score", M(tid, "U1-1")["w"] == m1["pa"] and "побеждает" in posts(c)
+      and bot.duels_in(CHAT, m1["pa"], *wk) == norm0 + 1, [(m, p) for m, p in c if m == "sendMessage"])
+c = shot(m1["pb"], m1["pa"], [False]); check("opponent's same screenshot changes nothing", "побеждает" not in posts(c), [])
+c = tap(6, f"ut:s:{tid}:U1-2"); check("only players can surrender", any(p.get("show_alert") for m, p in c if m == "answerCallbackQuery"), [])
+c = tap(m2["pb"], f"ut:s:{tid}:U1-2")
+check("surrender", M(tid, "U1-2")["w"] == m2["pa"] and "сдался" in posts(c), [])
+uf, l1 = M(tid, "U2-1"), M(tid, "L1-1")
+check("upper final and lower bracket open", uf["open"] and l1["open"] and {l1["pa"], l1["pb"]} == {m1["pb"], m2["pb"]}, [])
+GEM["answer"] = {"is_duel_history": True, "opponent": gname[uf["pb"]], "rows": [{"date": iso(today), "result": "draw", "score": "177.7 / 177.7"}]}
+c = photo(uf["pa"]); check("tie means re-ride", "ничья" in posts(c) and not M(tid, "U2-1")["done"], [])
+c = shot(uf["pb"], uf["pa"], [True]); check("winner by score from either side", M(tid, "U2-1")["w"] == uf["pb"], [])
+c = tick(21); check("match reminder", "ждём скрин" in posts(c), [])
+c = tick(31)
+l1 = M(tid, "L1-1")
+check("technical win to higher seed", l1["done"] and l1["w"] == min((l1["pa"], l1["pb"]), key=T(tid)["seeds"].index) and "техническая" in posts(c), [])
+l2 = M(tid, "L2-1")
+check("lower final: lower winner vs upper final loser", {l2["pa"], l2["pb"]} == {l1["w"], uf["pa"]}, [])
+shot(l2["pa"], l2["pb"], [True])
+gf = M(tid, "GF")
+check("grand final", {gf["pa"], gf["pb"]} == {uf["pb"], l2["pa"]}, [])
+c = shot(gf["pa"], gf["pb"], [True])
+check("final best of 3 continues", not M(tid, "GF")["done"] and "следующий заезд" in posts(c), [])
+c = shot(gf["pb"], gf["pa"], [False])
+t = T(tid)
+check("champion and places", t["state"] == "done" and t["places"] == [gf["pa"], gf["pb"], l2["pb"]] and "🥇" in posts(c)
+      and any(b["callback_data"] == f"ut:r:{tid}" for b in btns(c)), [(m, p) for m, p in c if m == "sendMessage"])
+j = bot.duels_json()["uts"]
+check("tournament in app data", j["hist"] and j["hist"][0]["title"] == "Ночной УТС" and j["active"][0]["state"] == "done"
+      and sum(v[0] for v in j["trophies"].values()) == 1, [("sendMessage", {"text": str(j)[:300]})])
+check("week champion", "Чемпион недели по мини-УТС" in bot.uts_week_champion(CHAT, *wk), [])
+c = tap(gf["pa"], f"ut:r:{tid}"); rem = [x for x in bot.uts_all().values() if x["id"] != tid] if T(tid) else []
+check("rematch with same players starts", rem and rem[0]["state"] == "run" and sorted(rem[0]["players"]) == sorted(t["seeds"]), [])
+bot.load_state(); bot.uts_all().pop(rem[0]["id"], None); bot.save_state()
+
+# автоотмена, «каждый с каждым», автопроходы, старт по времени, чек-ин, запасные
+def create(uid, taps=(), title=None):
+    dm(uid, text="/uts")
+    for x in taps:
+        tap(uid, f"ut:d:{x}")
+    c = tap(uid, "ut:d:ok"); bot.load_state()
+    return max(bot.uts_all().values(), key=lambda x: x["created"])["id"], c
+tid2, _ = create(OWNER, ["size"])
+c = tick(31); check("auto cancel when nobody joined", T(tid2) is None and any(m == "deleteMessage" for m, p in c)
+                     and any(p.get("chat_id") == OWNER and "отменён" in p.get("text", "") for m, p in c), [])
+tid3, _ = create(OWNER, ["size", "short"])
+for x in (USER, USER2, MOD):
+    tap(x, f"ut:j:{tid3}")
+c = tick(31); t3 = T(tid3)
+check("round robin when not full", t3["fmt"] == "rr" and len(t3["matches"]) == 6 and "каждый катает с каждым" in posts(c), [])
+for m in T(tid3)["matches"][:2]:
+    shot(m["pa"], m["pb"], [True])
+for m in T(tid3)["matches"][2:]:
+    tap(m["pb"], f"ut:s:{tid3}:{m['id']}")
+t3 = T(tid3); f = next((m for m in t3["matches"] if m["id"] == "F"), None)
+check("round robin final for top 2", f and f["open"] and f["bo"] == 3, [])
+tap(f["pb"], f"ut:s:{tid3}:F"); t3 = T(tid3)
+check("round robin finished", t3["state"] == "done" and len(t3["places"]) == 3 and t3["places"][0] == f["pa"], [])
+bot.load_state(); bot.uts_all().clear(); bot.save_state()
+tid4, _ = create(OWNER, ["size"])
+for x in (USER, USER2, MOD, ADMIN):
+    tap(x, f"ut:j:{tid4}")
+tick(31); t4 = T(tid4)
+check("byes when not full", t4["fmt"] == "elim" and sum(1 for m in t4["matches"] if m.get("bye") and m["id"].startswith("U1")) == 3
+      and t4["seeds"][0] in (M(tid4, "U2-1")["pa"], M(tid4, "U2-1")["pb"]), [])
+bot.load_state(); bot.uts_all().clear(); bot.save_state()
+tid5, c = create(OWNER, ["start", "start"])
+check("scheduled start", T(tid5)["start"] and "Старт: в " in posts(c), [])
+for x in (USER, USER2, MOD, ADMIN):
+    tap(x, f"ut:j:{tid5}")
+check("reserve when full", T(tid5)["reserve"] == [ADMIN] and T(tid5)["state"] == "reg", [])
+c = tick(46); check("reminder before start", sum(1 for m, p in c if m == "sendMessage" and "начнётся через 15" in p.get("text", "")) == 4, [])
+c = tick(56); check("check-in asked", sum(1 for m, p in c if any(b["callback_data"] == f"ut:c:{tid5}" for b in btns([(m, p)]))) == 4, [])
+for x in (OWNER, USER, USER2):
+    tap(x, f"ut:c:{tid5}")
+c = tick(61); t5 = T(tid5)
+check("no check-in -> reserve takes the place", t5["state"] == "run" and MOD not in t5["seeds"] and ADMIN in t5["seeds"]
+      and any(p.get("chat_id") == MOD and "не отметился" in p.get("text", "") for m, p in c), [])
+bot.load_state(); bot.uts_all().clear(); bot.save_state()
+# изменение и удаление организатором
+tid6, _ = create(USER)
+tap(OWNER, f"ut:j:{tid6}"); tap(USER2, f"ut:j:{tid6}")
+tap(USER, f"ut:e:{tid6}"); tap(USER, "ut:d:size"); c = tap(USER, "ut:d:ok")
+check("organizer edits tournament", T(tid6)["size"] == 8 and any(p.get("chat_id") == OWNER and "изменён" in p.get("text", "") for m, p in c), [])
+tap(USER, f"ut:e:{tid6}"); c = tap(USER, "ut:d:kick")
+check("kick list", any(b["callback_data"] == f"ut:k:{tid6}:{OWNER}" for b in btns(c)), [])
+c = tap(USER, f"ut:k:{tid6}:{OWNER}"); check("organizer kicks player", OWNER not in T(tid6)["players"], [])
+c = tap(USER, "ut:d:del"); check("organizer deletes tournament", T(tid6) is None and any(m == "deleteMessage" for m, p in c), [])
+CSV["text"] = "№,Имя,Телеграм\n1,Ernest,@ernest,0,,,Пилот\n2,Petya,@petya,0,,,Пилот\n"; bot._cache["time"] = 0
 print("\n".join(checks))
 failed = sum(c.startswith("FAIL") for c in checks)
 print("FAILED:", failed, "of", len(checks))
