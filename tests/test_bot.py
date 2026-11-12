@@ -489,6 +489,40 @@ GEM["answer"]["unreadable"] = False; GEM["answer"]["rows"][0]["score"] = "141.4 
 r = photo(OWNER); check("clear screen has no warning", "Плохо читается" not in said(r), r)
 check("tiny compressed photo detected", bot.small_photo({"photo": [{"width": 90, "height": 40}, {"width": 960, "height": 443}]})
       and not bot.small_photo({"photo": [{"width": 1280, "height": 591}]}) and not bot.small_photo({"document": {}}), [])
+
+# ---------- мастерская ливрей: владелец назначает ливрейщика, тот грузит ливреи в ЛС ----------
+c = dm(USER, text="/livery"); check("livery only for designers", "только ливрейщики" in texts(c), [])
+c = dm(ADMIN, text="/designer @ivan"); check("only owner appoints designers", "только владелец" in texts(c), [])
+r = send(OWNER, "/designer @nobody"); check("unknown designer", "Не нашёл" in said(r), r)
+r = send(OWNER, "/designer @ivan")
+check("owner appoints designer", "теперь ливрейщик" in said(r) and any(p["chat_id"] == USER and "/livery" in p["text"] for c2, p in r if c2 == "sendMessage"), r)
+c = dm(USER, text="/livery"); check("designer menu", "мастерская ливрей" in texts(c).lower() and any("lv:add" in json.dumps(p.get("reply_markup", {})) for m, p in c), [])
+c = tap(USER, "lv:add"); check("asks for livery photo", "Пришли скрин ливреи" in texts(c), [])
+c = dm(USER, photo=[{"file_id": "s"}, {"file_id": "lv1"}]); check("asks for description", "опиши ливрею" in texts(c).lower(), [])
+c = dm(USER, text="Неоновая KHR на S15"); check("asks for whom", "Для кого" in texts(c), [])
+c = dm(USER, text="@petya"); bot.load_state()
+check("livery saved", "добавлена в портфолио" in texts(c), [])
+des = [d for d in bot.liveries_json() if d["tg"] == "ivan"]
+check("livery in app data", des and des[0]["items"][0]["t"] == "Неоновая KHR на S15" and des[0]["items"][0]["for"] == "Petya"
+      and "f" not in des[0]["items"][0], [("sendMessage", {"text": str(des)})])
+lid = des[0]["items"][0]["id"]
+check("livery photo served", bot.livery_photo_bytes(lid) == b"\xff\xd8fakejpeg" and bot.livery_photo_bytes(1) is None, [])
+check("designers in duels json", any(d["tg"] == "ivan" for d in bot.duels_json()["designers"]), [])
+tap(USER, "lv:add"); dm(USER, photo=[{"file_id": "lv2"}]); dm(USER, text="Ливрея клуба")
+c = tap(USER, "lv:skip"); bot.load_state()
+items = [d for d in bot.liveries_json() if d["tg"] == "ivan"][0]["items"]
+check("livery for nobody", "добавлена" in texts(c) and items[0]["t"] == "Ливрея клуба" and items[0]["for"] == "", [])
+c = dm(USER, text="обычный текст"); check("plain text after save not captured", "добавлена" not in texts(c), [])
+c = tap(USER, "lv:list"); check("livery list", any("lv:del:" in json.dumps(p.get("reply_markup", {})) for m, p in c), [])
+c = tap(USER, f"lv:del:{lid}"); bot.load_state()
+check("livery deleted", "удалена" in texts(c) and len([d for d in bot.liveries_json() if d["tg"] == "ivan"][0]["items"]) == 1, [])
+c = tap(ADMIN, "lv:add"); check("non-designer cannot press livery buttons", any(p.get("show_alert") for m, p in c if m == "answerCallbackQuery"), [])
+r = send(OWNER, "/designer"); check("designer list", "Иван" in said(r), r)
+r = send(OWNER, "/designer @ivan off"); bot.load_state()
+check("designer removed", "Снял" in said(r) and not any(d["tg"] == "ivan" for d in bot.liveries_json()), r)
+CSV["text"] = "№,Имя,Телеграм\n1,Ernest,@ernest,0,,,Пилот\n2,Petya,@petya,0,,,Дизайнер ливрей\n"; bot._cache["time"] = 0
+check("designer by table role", bot.is_designer(u(USER2)) and not bot.is_designer(u(USER)), [])
+CSV["text"] = "№,Имя,Телеграм\n1,Ernest,@ernest,0,,,Пилот\n2,Petya,@petya,0,,,Пилот\n"; bot._cache["time"] = 0
 print("\n".join(checks))
 failed = sum(c.startswith("FAIL") for c in checks)
 print("FAILED:", failed, "of", len(checks))
