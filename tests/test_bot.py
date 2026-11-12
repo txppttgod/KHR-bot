@@ -401,6 +401,41 @@ GEM["answer"] = {"is_duel_history": True, "opponent": "Petya",
                           {"date": iso(today), "result": "win", "score": "130.2 / 115.5", "track": "Ebisu East"}]}
 r = photo(OWNER)
 check("two rows of one screen stay separate", "Засчитано новых дуэлей: 2" in said(r), r)
+
+# ---------- популярные карты ----------
+mp = lambda rows: {r[0]: r[1] for r in rows}
+bot.load_state(); bot.tracks.clear(); bot.save_state(); bot.load_state()
+check("all-time map counter filled from saved duels", mp(bot.tracks_top(CHAT)).get("Ebisu West") == 1, [])
+GEM["answer"] = {"is_duel_history": True, "opponent": "Petya",
+                 "rows": [{"date": iso(today), "result": "win", "score": "120.1 / 110.2", "track": "Fuji 2"},
+                          {"date": iso(today), "result": "win", "score": "125.5 / 111.1", "track": "fuji  2"}]}
+photo(OWNER); fuji_group = str(mid[0]); bot.load_state()
+week_maps = mp(bot.tracks_top(CHAT, *wk)); all_maps = mp(bot.tracks_top(CHAT))
+check("maps of the week count each duel once", week_maps.get("Fuji 2") == 2, [("sendMessage", {"text": str(week_maps)})])
+check("map names merged regardless of case and spaces", all_maps.get("Fuji 2") == 2 and "fuji  2" not in all_maps, [("sendMessage", {"text": str(all_maps)})])
+j = bot.duels_json()
+check("maps in app data", ["Fuji 2", 2] in [r[:2] for r in j["tracks"]["week"]] and any(r[0] == "Fuji 2" for r in j["tracks"]["all"]), [("sendMessage", {"text": str(j["tracks"])})])
+cb(OWNER, f"du:{OWNER}:{fuji_group}"); bot.load_state()
+check("undo removes maps too", "Fuji 2" not in mp(bot.tracks_top(CHAT)) and "Fuji 2" not in mp(bot.tracks_top(CHAT, *wk)), [])
+
+# ---------- логотипы карт: только владелец, через ЛС бота ----------
+c = dm(ADMIN, text="/maplogo"); check("only owner sets map logos", "только владелец" in texts(c), [])
+c = dm(OWNER, text="/maplogo")
+menu = [p for m, p in c if m == "sendMessage" and p.get("reply_markup")]
+check("map list for owner", menu and any("Ebisu West" in b[0]["text"] for b in menu[0]["reply_markup"]["inline_keyboard"]), [])
+idx = next(i for i, b in enumerate(menu[0]["reply_markup"]["inline_keyboard"]) if "Ebisu West" in b[0]["text"])
+c = tap(ADMIN, f"ml:{idx}"); check("admin cannot press logo buttons", any(p.get("show_alert") for m, p in c if m == "answerCallbackQuery"), [])
+c = tap(OWNER, f"ml:{idx}"); check("asks for logo picture", "Пришли картинку-логотип" in texts(c) and "Ebisu West" in texts(c), [])
+c = dm(OWNER, photo=[{"file_id": "s"}, {"file_id": "logo1"}]); bot.load_state()
+row = next(r for r in bot.tracks_top(CHAT) if r[0] == "Ebisu West")
+check("logo saved", "Логотип для карты «Ebisu West» поставлен" in texts(c) and row[2] > 0 and row[3] == "ebisu west", [])
+check("logo served by bot", bot.map_logo("ebisu west") == b"\xff\xd8fakejpeg" and bot.map_logo("nope") is None, [])
+check("logo in app data", any(r[0] == "Ebisu West" and r[2] > 0 for r in bot.duels_json()["tracks"]["all"]), [])
+c = dm(OWNER, text="/maplogo"); menu = [p for m, p in c if m == "sendMessage" and p.get("reply_markup")]
+check("logo marked in list", any(b[0]["text"].startswith("🖼 Ebisu West") for b in menu[0]["reply_markup"]["inline_keyboard"]), [])
+tap(OWNER, f"ml:{idx}"); c = tap(OWNER, f"mlx:{idx}"); bot.load_state()
+check("logo removed", "убран" in texts(c) and bot.map_logo("ebisu west") is None, [])
+c = dm(OWNER, photo=[{"file_id": "x"}]); check("after removal photo is not taken as logo", "Логотип" not in texts(c), [])
 print("\n".join(checks))
 failed = sum(c.startswith("FAIL") for c in checks)
 print("FAILED:", failed, "of", len(checks))
