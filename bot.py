@@ -114,7 +114,7 @@ def load_state():
     # Читаем базу перед каждым сообщением. Раньше она читалась один раз при запуске,
     # и если в этот момент Supabase не ответил, бот до перезапуска ничего не сохранял.
     # Так же не теряются данные, когда Render при деплое ненадолго держит две копии бота.
-    global DB_OK, members, stats, warns, staff, roles, settings, modlog, duels, profiles
+    global DB_OK, members, stats, warns, staff, roles, settings, modlog, duels, profiles, tracks
     ok, d = db_load()
     DB_OK = ok
     if not ok:
@@ -127,6 +127,7 @@ def load_state():
     modlog = int_keys(d.get("modlog", {}), 1)      # чат → [последние действия]
     duels = int_keys(d.get("duels", {}))        # чат → {человек: [дуэли]}
     profiles = int_keys(d.get("profiles", {}), 1)  # человек → {car, about, username, …}
+    tracks = int_keys(d.get("tracks", {}), 1)      # чат → {трасса: {"n": сколько дуэлей за всё время, "name": как писать}}
     warns = {}
     for k, n in d.get("warns", {}).items():
         c, u = k.split("_")
@@ -149,11 +150,12 @@ def state_dict():
         "modlog": str_keys(modlog, 1),
         "duels": str_keys(duels),
         "profiles": str_keys(profiles, 1),
+        "tracks": str_keys(tracks, 1),
         "warns": {f"{c}_{u}": n for (c, u), n in warns.items()},
     })
 
 
-members, stats, warns, staff, roles, settings, modlog, duels, profiles = {}, {}, {}, {}, {}, {}, {}, {}, {}
+members, stats, warns, staff, roles, settings, modlog, duels, profiles, tracks = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
 load_state()
 _cache = {"time": 0, "rows": []}
 
@@ -1127,6 +1129,139 @@ def mirror(score):
     return f"{parts[1]} / {parts[0]}" if len(parts) == 2 else score
 
 
+# ---------- Популярные карты: какие трассы клуб катает чаще всего ----------
+def track_key(name):
+    return re.sub(r"\s+", " ", (name or "").strip()).lower()
+
+
+def ensure_tracks(chat_id):
+    # Счётчик «за всё время» живёт отдельно от дуэлей (их бот хранит 70 дней).
+    # Первый раз заполняем его из уже сданных дуэлей: каждую считаем один раз, без копий у соперника.
+    if chat_id in tracks:
+        return tracks[chat_id]
+    t = tracks[chat_id] = {}
+    for lst in duels.get(chat_id, {}).values():
+        for d in lst:
+            k = track_key(d.get("t"))
+            if k and not d.get("by"):
+                e = t.setdefault(k, {"n": 0, "name": d["t"].strip()})
+                e["n"] += 1
+    return t
+
+
+def track_count(chat_id, name, delta):
+    k = track_key(name)
+    if not k:
+        return
+    e = ensure_tracks(chat_id).setdefault(k, {"n": 0, "name": name.strip()})
+    e["n"] = max(0, e["n"] + delta)
+
+
+def tracks_top(chat_id, start=None, end=None, limit=10):
+    # За неделю — по сданным дуэлям этой недели, за всё время — по счётчику
+    if start is None:
+        rows = [(e["name"], e["n"]) for e in ensure_tracks(chat_id).values() if e["n"] > 0]
+    else:
+        a, b, cnt, nm = start.isoformat(), end.isoformat(), {}, {}
+        for lst in duels.get(chat_id, {}).values():
+            for d in lst:
+                k = track_key(d.get("t"))
+                if k and not d.get("by") and a <= d["d"] <= b:
+                    cnt[k] = cnt.get(k, 0) + 1
+                    nm.setdefault(k, d["t"].strip())
+        rows = [(nm[k], n) for k, n in cnt.items()]
+    rows.sort(key=lambda x: (-x[1], x[0].lower()))
+    # [название, сколько дуэлей, версия логотипа (0 — нет), ключ для ссылки на логотип]
+    known = tracks.get(chat_id, {})
+    return [[n, c, known.get(track_key(n), {}).get("lv", 0) if known.get(track_key(n), {}).get("logo") else 0,
+             track_key(n)] for n, c in rows[:limit]]
+
+
+# ---------- Логотипы карт: ставит только владелец клуба через ЛС бота (/maplogo) ----------
+_logo_cache = {}  # ключ трассы → (file_id, байты)
+
+
+def is_owner(uid):
+    chat_id = club_chat()
+    return bool(chat_id) and get_level(chat_id, uid) >= 3
+
+
+def maplogo_menu(msg):
+    uid = msg["from"]["id"]
+    if msg["chat"]["type"] != "private":
+        reply(msg, "Логотипы карт ставятся в личке бота: напиши ему /maplogo.")
+        return
+    if not is_owner(uid):
+        reply(msg, "Логотипы карт может ставить только владелец клуба.")
+        return
+    chat_id = club_chat()
+    t = ensure_tracks(chat_id)
+    keys = sorted(t, key=lambda k: (-t[k]["n"], k))[:30]
+    if not keys:
+        reply(msg, "Пока нет ни одной карты — они появятся, когда бот прочитает трассы со скринов дуэлей.")
+        return
+    profiles.setdefault(uid, {})["maps"] = keys
+    kb = [[{"text": ("🖼 " if t[k].get("logo") else "") + f"{t[k]['name']} · {t[k]['n']}", "callback_data": f"ml:{i}"}]
+          for i, k in enumerate(keys)]
+    api("sendMessage", {"chat_id": msg["chat"]["id"], "reply_markup": {"inline_keyboard": kb},
+                        "text": "🗺 Выбери карту, для которой поставить логотип.\n🖼 — логотип уже есть, его можно заменить."})
+
+
+def maplogo_callback(cq):
+    uid = cq["from"]["id"]
+    chat = (cq.get("message") or {}).get("chat", {}).get("id", uid)
+    answer = lambda text="", alert=False: api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": text,
+                                                                      "show_alert": alert})
+    if not is_owner(uid):
+        answer("Логотипы карт может ставить только владелец клуба.", True)
+        return
+    kind, i = cq["data"].split(":")
+    keys = profiles.get(uid, {}).get("maps", [])
+    t = ensure_tracks(club_chat())
+    if not i.isdigit() or int(i) >= len(keys) or keys[int(i)] not in t:
+        answer("Список устарел, набери /maplogo ещё раз.", True)
+        return
+    key = keys[int(i)]
+    if kind == "mlx":
+        t[key].pop("logo", None)
+        profiles[uid].pop("await", None)  # картинку больше не ждём
+        api("sendMessage", {"chat_id": chat, "text": f"🗑 Логотип карты «{t[key]['name']}» убран."})
+    else:
+        profiles[uid]["await"] = "maplogo:" + key
+        payload = {"chat_id": chat, "text": f"🖼 Пришли картинку-логотип для карты «{t[key]['name']}» одним фото."}
+        if t[key].get("logo"):
+            payload["reply_markup"] = {"inline_keyboard": [[{"text": "🗑 Убрать логотип", "callback_data": f"mlx:{i}"}]]}
+        api("sendMessage", payload)
+    answer()
+
+
+def maplogo_photo(msg, key):
+    t = ensure_tracks(club_chat())
+    profiles.get(msg["from"]["id"], {}).pop("await", None)
+    if key not in t or not is_owner(msg["from"]["id"]):
+        reply(msg, "Не получилось: набери /maplogo и выбери карту ещё раз.")
+        return
+    t[key]["logo"] = duel_image(msg)[0]
+    t[key]["lv"] = int(time.time())
+    reply(msg, f"✅ Логотип для карты «{t[key]['name']}» поставлен — он уже в приложении. Ещё карту: /maplogo")
+
+
+def map_logo(key):
+    # Байты логотипа карты для сайта (токен бота наружу не попадает)
+    e = tracks.get(club_chat(), {}).get(key)
+    if not e or not e.get("logo"):
+        return None
+    cached = _logo_cache.get(key)
+    if cached and cached[0] == e["logo"]:
+        return cached[1]
+    data = tg_file(e["logo"])
+    if data:
+        _logo_cache[key] = (e["logo"], data)
+        while len(_logo_cache) > 60:
+            _logo_cache.pop(next(iter(_logo_cache)))
+    return data
+
+
 def score_pair(s):
     nums = re.findall(r"\d+(?:\.\d+)?", s or "")
     return (float(nums[0]), float(nums[1])) if len(nums) >= 2 else None
@@ -1176,6 +1311,7 @@ def add_duels(chat_id, uid, opponent, rows, group, items=None, alerts=None):
     # второй раз она не считается, а помечается «c» — подтверждена обоими.
     # В alerts — подозрение на накрутку: другой участник уже сдал те же дуэли с тем же соперником.
     items = [] if items is None else items
+    ensure_tracks(chat_id)  # заполнить счётчик карт до того, как добавим новые дуэли
     mine = duels.setdefault(chat_id, {}).setdefault(uid, [])
     have = {(d["d"], d["o"].lower(), d["s"]) for d in mine}
     have |= {(d, o, mirror(s)) for d, o, s in have}  # у соперника счёт может быть записан наоборот
@@ -1243,6 +1379,8 @@ def add_duels(chat_id, uid, opponent, rows, group, items=None, alerts=None):
                                                    and d["s"] == score for d in lst):
                 same[other] = same.get(other, 0) + 1
         mine.append(rec)
+        if not rec.get("c"):  # если соперник уже сдал эту дуэль раньше, карту за неё он уже посчитал
+            track_count(chat_id, rec["t"], +1)
         reason = why_not_counted(rec, names)
         if not reason:
             added += 1
@@ -1412,6 +1550,9 @@ def handle_callback(cq):
     if data.startswith("pfdel:"):
         photo_remove_callback(cq)
         return
+    if data.startswith(("ml:", "mlx:")):
+        maplogo_callback(cq)
+        return
     msg = cq.get("message") or {}
     chat_id = (msg.get("chat") or {}).get("id")
     if not data.startswith("du:") or not chat_id:
@@ -1434,6 +1575,9 @@ def handle_callback(cq):
         return
     mine = duels.get(chat_id, {}).get(uid, [])
     removed = sum(1 for d in mine if d.get("g") == group and not d.get("by"))
+    for d in mine:
+        if d.get("g") == group and not d.get("by") and not d.get("c"):
+            track_count(chat_id, d.get("t"), -1)
     if uid in duels.get(chat_id, {}):
         duels[chat_id][uid] = [d for d in mine if d.get("g") != group or d.get("by")]
     # Снимаем и дуэли, которые этот отчёт засчитал соперникам
@@ -1566,7 +1710,20 @@ def duels_json():
                                                     "about": p.get("about", "")}
                 for p in profiles.values() if p.get("username") and (p.get("car") or p.get("about"))}
         return {"week": week_label(start, end), "prev_week": week_label(pstart, pend), "norm": norm,
-                "pilots": pilots, "profiles": prof}
+                "pilots": pilots, "profiles": prof, "tracks": tracks_json()}
+
+
+def tracks_json():
+    # Популярные карты для приложения: за эту неделю и за всё время (по чату клуба)
+    chat_id = club_chat()
+    if not chat_id:
+        return {"week": [], "all": []}
+    fresh = chat_id not in tracks
+    start, end = week_bounds()
+    out = {"week": tracks_top(chat_id, start, end), "all": tracks_top(chat_id)}
+    if fresh:
+        save_state()  # счётчик «за всё время» только что заполнили из сданных дуэлей — запоминаем
+    return out
 
 
 def sheet_payload(chat_id):
@@ -1857,6 +2014,9 @@ def profile_photo_message(msg):
     # Фото в личке бота: если человек сейчас ставит фото машины — показываем и спрашиваем «Ставим?»
     uid = msg["from"]["id"]
     p = profiles.get(uid, {})
+    if str(p.get("await", "")).startswith("maplogo:"):
+        maplogo_photo(msg, p["await"].split(":", 1)[1])
+        return
     if p.get("await") != "car":
         reply(msg, "Чтобы поставить фото машины в профиль, набери /myprofile и нажми «🚗 Фото машины».")
         return
@@ -2054,6 +2214,7 @@ HELP_TEXT = """📖 Команды бота
 /welcome on|off — включить или выключить приветствие
 /duelhere — написать в теме отчётов: бот начнёт считать там дуэли (off — выключить)
 /setnorm 20 — норма дуэлей в неделю
+/maplogo — только владелец, в ЛС бота: логотипы карт для рейтинга карт в приложении
 
 🤖 Сам бот: в пятницу 18:00 напоминает тем, у кого меньше половины нормы, в понедельник 10:00 подводит
 итоги недели. Админам в ЛС приходит список не выполнивших норму с кнопками варна и сигналы о возможной
@@ -2155,6 +2316,9 @@ def handle(msg):
     if cmd == "myprofile" or (cmd == "start" and not is_group and args[:1] == ["profile"]):
         myprofile(msg)
         return
+    if cmd == "maplogo":
+        maplogo_menu(msg)
+        return
 
     if cmd in ADMIN_CMDS:
         if is_group:
@@ -2226,11 +2390,12 @@ class Handler(BaseHTTPRequestHandler):
             save_state()
 
     def do_GET(self):
-        if self.path.startswith("/photo/"):
-            # Фото машины пилота для приложения: /photo/<@ник>?v=<версия>
-            name = self.path[len("/photo/"):].split("?")[0]
+        if self.path.startswith(("/photo/", "/maplogo/")):
+            # Фото машины пилота (/photo/<@ник>) или логотип карты (/maplogo/<трасса>) для приложения
+            is_logo = self.path.startswith("/maplogo/")
+            name = self.path.split("/", 2)[2].split("?")[0]
             try:
-                data = profile_photo(unquote(name))
+                data = map_logo(unquote(name)) if is_logo else profile_photo(unquote(name))
             except Exception as e:
                 print("Ошибка /photo:", repr(e))
                 data = None
