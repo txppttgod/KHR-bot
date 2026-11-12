@@ -12,6 +12,7 @@ import requests
 import queue
 import hmac
 import hashlib
+import random
 from urllib.parse import unquote, parse_qsl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1521,7 +1522,9 @@ def apply_duel(msg, res, err):
         s["bad"] += 1
     else:
         alerts = []
+        before = len(s["items"])
         a, d, k = add_duels(chat_id, user["id"], res.get("opponent"), res["rows"], group, s["items"], alerts)
+        uts_on_report(chat_id, user["id"], res.get("opponent"), s["items"][before:])  # матч мини-УТС?
         s["added"] += a
         s["dup"] += d
         s["skip"] += k
@@ -1580,6 +1583,9 @@ def handle_callback(cq):
         return
     if data.startswith("lvo:"):
         order_callback(cq)
+        return
+    if data.startswith("ut:"):
+        uts_callback(cq)
         return
     msg = cq.get("message") or {}
     chat_id = (msg.get("chat") or {}).get("id")
@@ -1743,7 +1749,7 @@ def duels_json():
                 for p in profiles.values() if p.get("username") and (p.get("car") or p.get("about"))}
         return {"week": week_label(start, end), "prev_week": week_label(pstart, pend), "norm": norm,
                 "pilots": pilots, "profiles": prof, "tracks": tracks_json(), "awards": awards,
-                "rivalries": rivalries(club, names) if club else [], "designers": liveries_json()}
+                "rivalries": rivalries(club, names) if club else [], "designers": liveries_json(), "uts": uts_json()}
 
 
 def tracks_json():
@@ -2028,7 +2034,7 @@ def monday_summary(chat_id, now):
         text += "\n\n" + "\n".join(f"✅ {p['name']} — {n}" for n, p in done)
     if fail:
         text += "\n\n" + "\n".join(f"❌ {p['name']} — {n}/{norm}" for n, p in fail)
-    aw = awards_text(week_awards(chat_id, start, end))
+    aw = "\n".join(x for x in (awards_text(week_awards(chat_id, start, end)), uts_week_champion(chat_id, start, end)) if x)
     if aw:
         text += "\n\n🏆 Награды недели\n" + aw
     post_to_reports(chat_id, text)
@@ -2231,6 +2237,9 @@ def profile_text_message(msg):
     wait = str(p.get("await", ""))
     if (wait in ("lv_title", "lv_for") or wait.startswith(("lv_et:", "lv_ef:"))) and text and not text.startswith("/"):
         livery_text(msg, p)
+        return True
+    if wait.startswith("uts_") and text and not text.startswith("/"):
+        uts_draft_text_input(msg, p)
         return True
     if wait.startswith("order:") and text and not text.startswith("/"):
         order_text(msg, p)
@@ -2812,6 +2821,787 @@ def livery_photo_bytes(name):
     return data
 
 
+# ---------- Мини-УТС: турниры без судей и организаторов ----------
+# Любой пилот из таблицы создаёт турнир (/uts в ЛС бота или кнопка в приложении), остальные жмут «Участвую».
+# Бот сам строит сетку (на вылет или с лузер-сеткой), зовёт пары, читает победителя по баллам со скрина
+# «История заездов» (это обычный отчёт — дуэль идёт и в норму), даёт техпоражения и объявляет чемпиона.
+# Турниры: settings[чат]["uts"] = {id: турнир}, история: settings[чат]["uts_hist"].
+UTS_SIZES = [4, 8, 16, 32]
+UTS_REG_MIN = 30        # «старт сразу»: столько минут ждём набора, потом отмена
+UTS_REMIND_MIN = 15     # напоминание в ЛС до старта
+UTS_CHECKIN_MIN = 5     # «Ты на месте?» до старта
+UTS_PING_MIN = 20       # пара молчит — напоминаем
+UTS_TECH_MIN = 30       # пара молчит — техническое поражение
+UTS_RR_MAX_MIN = 180    # «каждый с каждым» длится не дольше
+UTS_KEEP_DONE_H = 24    # законченный турнир ещё сутки виден в приложении (и можно позвать на реванш)
+UTS_HIST = 60
+UTS_START = {"now": "как наберёмся", "30": "через 30 мин", "60": "через 1 час", "120": "через 2 часа"}
+UTS_SHORT = {"cancel": "отменить", "bye": "автопроходы", "rr": "каждый с каждым"}
+UTS_TRACK = {"random": "случайная из популярных", "each": "новая на каждый матч", "fixed": "своя"}
+
+
+def uts_all():
+    return settings.setdefault(club_chat(), {}).setdefault("uts", {})
+
+
+def uts_name(uid):
+    return pilot_name(club_chat(), uid) or str(uid)
+
+
+def uts_tag(uid):
+    u = members.get(club_chat(), {}).get(uid, {})
+    return f"@{u['username']}" if u.get("username") else uts_name(uid)
+
+
+def msk_hm(ts):
+    return (datetime.datetime.utcfromtimestamp(ts) + datetime.timedelta(hours=3)).strftime("%H:%M")
+
+
+def uts_random_track():
+    top = [r[0] for r in tracks_top(club_chat())] if club_chat() else []
+    return random.choice(top) if top else ""
+
+
+def uts_post(text, markup=None):
+    # Всё о турнирах — в тему отчётов: туда же пилоты кидают скрины матчей
+    chat_id = club_chat()
+    payload = {"chat_id": chat_id, "text": text}
+    if settings.get(chat_id, {}).get("duel_thread"):
+        payload["message_thread_id"] = settings[chat_id]["duel_thread"]
+    if markup:
+        payload["reply_markup"] = markup
+    return api("sendMessage", payload).get("result", {}).get("message_id")
+
+
+def uts_dm(uids, text, markup=None):
+    for uid in uids:
+        payload = {"chat_id": uid, "text": text}
+        if markup:
+            payload["reply_markup"] = markup
+        api("sendMessage", payload)
+
+
+# --- сетка ---
+def seed_order(size):
+    # Классическая расстановка: 1–N, 2–(N-1)… — сильные (первые) номера получают автопроходы, если людей не хватает
+    order = [1]
+    while len(order) < size:
+        m = len(order) * 2 + 1
+        order = [x for s in order for x in (s, m - s)]
+    return order
+
+
+def uts_m(t, mid):
+    return next((m for m in t["matches"] if m["id"] == mid), None)
+
+
+def uts_new_match(t, mid, a, b, name, bo=1):
+    m = {"id": mid, "a": a, "b": b, "name": name, "pa": None, "pb": None, "w": None, "l": None,
+         "done": False, "bo": bo, "sa": 0, "sb": 0, "games": []}
+    t["matches"].append(m)
+    return m
+
+
+def uts_round_name(r, k, de):
+    if r == k:
+        return "Финал верхней сетки" if de else "Финал"
+    if r == k - 1:
+        return "Полуфинал верхней сетки" if de else "Полуфинал"
+    return f"1/{2 ** (k - r)} финала" + (" (верхняя сетка)" if de else "")
+
+
+def uts_build_elim(t, seeds):
+    n = len(seeds)
+    size = 2
+    while size < n:
+        size *= 2
+    k = size.bit_length() - 1
+    slots = [seeds[i - 1] if i <= n else None for i in seed_order(size)]
+    de = t["de"] and size >= 4
+    win = lambda m: {"m": m["id"], "t": "w"}
+    lose = lambda m: {"m": m["id"], "t": "l"}
+    up = [[uts_new_match(t, f"U1-{i + 1}", {"p": slots[2 * i]}, {"p": slots[2 * i + 1]}, uts_round_name(1, k, de))
+           for i in range(size // 2)]]
+    for r in range(2, k + 1):
+        prev = up[-1]
+        up.append([uts_new_match(t, f"U{r}-{i + 1}", win(prev[2 * i]), win(prev[2 * i + 1]), uts_round_name(r, k, de))
+                   for i in range(len(prev) // 2)])
+    if de:
+        lr = 1
+        low = [uts_new_match(t, f"L1-{i + 1}", lose(up[0][2 * i]), lose(up[0][2 * i + 1]), "Нижняя сетка")
+               for i in range(len(up[0]) // 2)]
+        for j in range(2, k + 1):
+            lr += 1
+            uj = up[j - 1]
+            # Проигравших сверху ставим «наоборот», чтобы пары из одной половины сетки не встречались сразу снова
+            low = [uts_new_match(t, f"L{lr}-{i + 1}", win(low[i]), lose(uj[len(uj) - 1 - i]), "Нижняя сетка")
+                   for i in range(len(low))]
+            if j < k:
+                lr += 1
+                low = [uts_new_match(t, f"L{lr}-{i + 1}", win(low[2 * i]), win(low[2 * i + 1]), "Нижняя сетка")
+                       for i in range(len(low) // 2)]
+        low[0]["name"] = "Финал нижней сетки"
+        uts_new_match(t, "GF", win(up[-1][0]), win(low[0]), "Гранд-финал", bo=t["bo"])
+        t["final"], t["third"] = "GF", low[0]["id"]
+    else:
+        up[-1][0]["bo"] = t["bo"]
+        t["final"] = up[-1][0]["id"]
+        if k >= 2:
+            uts_new_match(t, "B3", lose(up[-2][0]), lose(up[-2][1]), "Матч за 3-е место")
+            t["third"] = "B3"
+
+
+def uts_build_rr(t, seeds):
+    for i in range(len(seeds)):
+        for j in range(i + 1, len(seeds)):
+            uts_new_match(t, f"R{i + 1}-{j + 1}", {"p": seeds[i]}, {"p": seeds[j]}, "Каждый с каждым")
+
+
+def uts_slot(t, s):
+    # (готов ли слот, кто в нём): игрок, победитель или проигравший другого матча
+    if "p" in s:
+        return True, s["p"]
+    m = uts_m(t, s["m"])
+    if not m or not m["done"]:
+        return False, None
+    return True, m["w"] if s["t"] == "w" else m["l"]
+
+
+def uts_standings(t):
+    # «Каждый с каждым»: победы, потом разница баллов
+    table = {uid: [0, 0.0] for uid in t["seeds"]}
+    for m in t["matches"]:
+        if not m["id"].startswith("R"):
+            continue
+        for g in m["games"]:
+            w, a, b = g
+            if w in table:
+                table[w][0] += 1
+            if m["pa"] in table:
+                table[m["pa"]][1] += a - b
+            if m["pb"] in table:
+                table[m["pb"]][1] += b - a
+    return sorted(table, key=lambda u: (-table[u][0], -table[u][1], t["seeds"].index(u))), table
+
+
+def uts_advance(t):
+    # Протаскиваем по сетке автопроходы и открываем матчи, где оба соперника уже известны
+    changed = True
+    while changed:
+        changed = False
+        for m in t["matches"]:
+            if m["done"]:
+                continue
+            ra, pa = uts_slot(t, m["a"])
+            rb, pb = uts_slot(t, m["b"])
+            m["pa"], m["pb"] = pa, pb
+            if ra and rb and (pa is None or pb is None):
+                m.update(done=True, w=pa if pb is None else pb, l=None, bye=True)
+                changed = True
+            elif ra and rb and not m.get("open"):
+                uts_open(t, m, quiet=m["id"].startswith("R"))
+    if t.get("fmt") == "rr" and not t.get("final"):
+        if all(m["done"] for m in t["matches"]):
+            order, _ = uts_standings(t)
+            if len(order) >= 4:
+                uts_new_match(t, "F", {"p": order[0]}, {"p": order[1]}, "Финал", bo=t["bo"])
+                t["final"] = "F"
+                t["rr_third"] = order[2]
+                uts_advance(t)
+                return
+            t["final"] = "-"
+    final = uts_m(t, t.get("final", ""))
+    if t["state"] == "run" and (t.get("final") == "-" or (final and final["done"])):
+        uts_finish(t)
+
+
+def uts_open(t, m, quiet=False):
+    m["open"] = time.time()
+    m["track"] = uts_random_track() if t["track_mode"] == "each" else t.get("track", "")
+    if quiet:  # «каждый с каждым»: все пары открываются сразу, список — одним сообщением при старте
+        return
+    bo = f" · до {(m['bo'] + 1) // 2} побед" if m["bo"] > 1 else ""
+    m["msg"] = uts_post(f"⚔️ {t['title']} · {m['name']}{bo}\n{uts_tag(m['pa'])} vs {uts_tag(m['pb'])}"
+                        + (f"\nТрасса: {m['track']}" if m.get("track") else "")
+                        + "\n\nКатайте дуэль и киньте сюда скрин «История заездов» — победителя бот определит по баллам. "
+                        f"На матч {UTS_TECH_MIN} мин.",
+                        {"inline_keyboard": [[{"text": "🏳 Сдаться", "callback_data": f"ut:s:{t['id']}:{m['id']}"}]]})
+
+
+def uts_result(t, m, winner, note=""):
+    m.update(done=True, w=winner, l=m["pb"] if winner == m["pa"] else m["pa"])
+    score = f" ({m['sa']}:{m['sb']})" if m["bo"] > 1 else ""
+    uts_post(f"✅ {t['title']} · {m['name']}: побеждает {uts_name(winner)}{score}{note}")
+    uts_advance(t)
+
+
+def uts_game(t, m, winner, a, b):
+    # Один заезд матча: a — баллы первого в паре, b — второго
+    m["games"].append([winner, a, b])
+    if winner == m["pa"]:
+        m["sa"] += 1
+    else:
+        m["sb"] += 1
+    need = (m["bo"] + 1) // 2
+    if max(m["sa"], m["sb"]) >= need:
+        uts_result(t, m, winner, f" — {a:g} / {b:g}" if m["bo"] == 1 else "")
+    else:
+        uts_post(f"🔁 {m['name']}: {uts_name(m['pa'])} {m['sa']} : {m['sb']} {uts_name(m['pb'])} — следующий заезд!")
+
+
+def uts_on_report(chat_id, uid, opponent, items):
+    # Новый скрин в теме отчётов: если это матч идущего турнира — засчитываем заезды по баллам
+    if chat_id != club_chat():
+        return
+    opp = uid_by_game_name(chat_id, re.sub(r"^\s*vs\.?\s*", "", opponent or "", flags=re.I).strip())
+    if not opp:
+        return
+    for t in uts_all().values():
+        if t["state"] != "run":
+            continue
+        m = next((m for m in t["matches"] if not m["done"] and m.get("open") and {m["pa"], m["pb"]} == {uid, opp}), None)
+        if not m:
+            continue
+        for it in items:
+            if m["done"] or it[4] != "new":
+                continue
+            sc = score_pair(it[3])
+            if not sc:
+                continue
+            if sc[0] == sc[1]:
+                uts_post(f"🤝 {m['name']}: ничья по баллам ({sc[0]:g} / {sc[1]:g}) — переезд!")
+                continue
+            me_first = m["pa"] == uid
+            a, b = (sc[0], sc[1]) if me_first else (sc[1], sc[0])
+            uts_game(t, m, m["pa"] if a > b else m["pb"], a, b)
+        return
+
+
+def uts_finish(t):
+    t["state"] = "done"
+    t["ended"] = time.time()
+    if t.get("fmt") == "rr" and t.get("final") == "-":
+        order, _ = uts_standings(t)
+        places = order[:3]
+    else:
+        f = uts_m(t, t["final"])
+        third = uts_m(t, t.get("third", ""))
+        places = [f["w"], f["l"]] + ([third["l"] if t.get("de") and third["id"].startswith("L") else third["w"]] if third else
+                                     ([t["rr_third"]] if t.get("rr_third") else []))
+    t["places"] = [p for p in places if p]
+    medals = ["🥇", "🥈", "🥉"]
+    uts_post(f"🏆 {t['title']} завершён!\n\n" + "\n".join(f"{medals[i]} {uts_name(p)}" for i, p in enumerate(t["places"]))
+             + "\n\nСетка — в приложении клуба: «Пилоты» → «🏁 Турниры».",
+             {"inline_keyboard": [[{"text": "🔁 Реванш тем же составом", "callback_data": f"ut:r:{t['id']}"}]]})
+    hist = settings.setdefault(club_chat(), {}).setdefault("uts_hist", [])
+    hist.append({"id": t["id"], "title": t["title"], "d": msk_today().isoformat(), "n": len(t["seeds"]), "places": t["places"]})
+    del hist[:-UTS_HIST]
+
+
+def uts_begin(t):
+    seeds = t["players"][:]
+    random.shuffle(seeds)
+    t.update(seeds=seeds, state="run", began=time.time(), matches=[])
+    t["fmt"] = "rr" if len(seeds) < t["size"] and t["short"] == "rr" else "elim"
+    if t["fmt"] == "rr":
+        uts_build_rr(t, seeds)
+    else:
+        uts_build_elim(t, seeds)
+    if t.get("msg"):
+        api("editMessageText", {"chat_id": club_chat(), "message_id": t["msg"], "text": uts_reg_text(t) + "\n\n▶️ Турнир начался!",
+                                "reply_markup": {"inline_keyboard": []}})
+    fmt = ("каждый с каждым" + (", потом финал" if len(seeds) >= 4 else "")) if t["fmt"] == "rr" else \
+        ("с лузер-сеткой" if t["de"] and len(seeds) > 2 else "на вылет")
+    uts_post(f"🏁 {t['title']} стартует! Участников: {len(seeds)}, формат: {fmt}.\n"
+             + "Посев: " + ", ".join(f"{i + 1}. {uts_name(u)}" for i, u in enumerate(seeds))
+             + "\nПары будут появляться здесь. Сетка — в приложении: «Пилоты» → «🏁 Турниры».")
+    if t["fmt"] == "rr":
+        uts_post(f"🔄 {t['title']}: каждый катает с каждым, в любом порядке. Пары:\n"
+                 + "\n".join(f"• {uts_tag(m['a']['p'])} vs {uts_tag(m['b']['p'])}" for m in t["matches"])
+                 + f"\n\nПосле каждой дуэли кидайте скрин сюда. На всё — {UTS_RR_MAX_MIN // 60} ч.")
+    uts_advance(t)
+
+
+def uts_cancel(t, why):
+    if t.get("msg"):
+        api("deleteMessage", {"chat_id": club_chat(), "message_id": t["msg"]})
+    uts_dm(set(t["players"] + t["reserve"]), f"❌ Турнир «{t['title']}» отменён: {why}.")
+    uts_all().pop(t["id"], None)
+
+
+# --- регистрация ---
+def uts_when(t):
+    if t.get("start"):
+        return f"в {msk_hm(t['start'])} МСК"
+    return f"как только наберёмся (до {msk_hm(t['deadline'])} МСК)"
+
+
+def uts_reg_text(t):
+    track = t.get("track") or ("новая случайная на каждый матч" if t["track_mode"] == "each" else "любая")
+    lines = [f"🏁 {t['title']}", f"Топ-{t['size']} · {'с лузер-сеткой' if t['de'] else 'на вылет'} · финал до {(t['bo'] + 1) // 2} побед",
+             f"Трасса: {track}", f"Старт: {uts_when(t)}", f"Организатор: {uts_name(t['by'])}",
+             f"Если не наберёмся: {UTS_SHORT[t['short']]}", "", f"Участники {len(t['players'])}/{t['size']}:"]
+    lines += [f"{i + 1}. {uts_name(u)}" for i, u in enumerate(t["players"])] or ["пока никого"]
+    if t["reserve"]:
+        lines.append("Запасные: " + ", ".join(uts_name(u) for u in t["reserve"]))
+    return "\n".join(lines)
+
+
+def uts_reg_kb(t):
+    return {"inline_keyboard": [[{"text": "✋ Участвую", "callback_data": f"ut:j:{t['id']}"},
+                                 {"text": "🚪 Выйти", "callback_data": f"ut:x:{t['id']}"}],
+                                [{"text": "⚙️ Изменить (организатор)", "callback_data": f"ut:e:{t['id']}"}]]}
+
+
+def uts_refresh(t):
+    if t.get("msg") and t["state"] == "reg":
+        api("editMessageText", {"chat_id": club_chat(), "message_id": t["msg"], "text": uts_reg_text(t), "reply_markup": uts_reg_kb(t)})
+
+
+def uts_busy(uid, but=None):
+    return any(uid in x["players"] for x in uts_all().values() if x["state"] in ("reg", "run") and x is not but)
+
+
+def uts_join(t, user):
+    uid = user["id"]
+    if t["state"] != "reg":
+        return "Запись на этот турнир уже закрыта."
+    if not can_have_profile(user):
+        return "Участвовать могут только пилоты из таблицы клуба."
+    if uid in t["players"] or uid in t["reserve"]:
+        return "Ты уже записан(а)."
+    if uts_busy(uid, t):
+        return "Ты уже в другом турнире."
+    remember(club_chat(), user)
+    if len(t["players"]) < t["size"]:
+        t["players"].append(uid)
+        res = "✅ Ты в турнире!"
+    else:
+        t["reserve"].append(uid)
+        res = "Мест нет — ты в листе ожидания. Освободится место — займёшь его."
+    uts_refresh(t)
+    if not t.get("start") and len(t["players"]) >= t["size"]:
+        uts_begin(t)
+    return res
+
+
+def uts_leave(t, uid):
+    if t["state"] != "reg":
+        return "Турнир уже идёт — выйти нельзя (можно сдаться в своём матче)."
+    if uid in t["reserve"]:
+        t["reserve"].remove(uid)
+    elif uid in t["players"]:
+        t["players"].remove(uid)
+        if t["reserve"]:
+            nxt = t["reserve"].pop(0)
+            t["players"].append(nxt)
+            uts_dm([nxt], f"✅ В турнире «{t['title']}» освободилось место — ты в основном составе!")
+    else:
+        return "Тебя и так нет в списке."
+    uts_refresh(t)
+    return "Ты вышел(ла) из турнира."
+
+
+def uts_create(uid, d, players=None):
+    now = time.time()
+    if d["start"] == "now":
+        start, deadline = None, now + UTS_REG_MIN * 60
+    elif d["start"] in UTS_START:
+        start = now + int(d["start"]) * 60
+        deadline = start
+    else:
+        start = deadline = uts_parse_time(d["start"])
+    tid = str(int(now * 1000) % 10 ** 9)
+    t = {"id": tid, "title": d["title"], "by": uid, "size": d["size"], "de": d["de"], "bo": d["bo"], "short": d["short"],
+         "track_mode": d["track_mode"], "track": d["track"] if d["track_mode"] == "fixed" else
+         (uts_random_track() if d["track_mode"] == "random" else ""), "start": start, "deadline": deadline,
+         "created": now, "players": [], "reserve": [], "checkin": [], "state": "reg", "matches": []}
+    uts_all()[tid] = t
+    for p in players or [uid]:
+        if not uts_busy(p, t) and len(t["players"]) < t["size"]:
+            t["players"].append(p)
+    t["msg"] = uts_post(uts_reg_text(t), uts_reg_kb(t))
+    if not start and len(t["players"]) >= t["size"]:
+        uts_begin(t)
+    return t
+
+
+def uts_parse_time(text):
+    mt = re.match(r"^\s*(\d{1,2})[:.](\d{2})\s*$", text or "")
+    if not mt or int(mt.group(1)) > 23 or int(mt.group(2)) > 59:
+        return None
+    now = msk_now()
+    target = now.replace(hour=int(mt.group(1)), minute=int(mt.group(2)), second=0, microsecond=0)
+    if target <= now:
+        target += datetime.timedelta(days=1)
+    return time.time() + (target - now).total_seconds()
+
+
+# --- мастер создания и изменения турнира (в ЛС бота) ---
+def uts_new_draft():
+    return {"size": 4, "de": True, "start": "now", "track_mode": "random", "track": "", "bo": 3, "short": "bye",
+            "title": "Мини-УТС"}
+
+
+def uts_draft_text(d):
+    when = {"keep": "без изменений"}.get(d["start"]) or UTS_START.get(d["start"]) or f"в {d['start']} МСК"
+    track = d["track"] if d["track_mode"] == "fixed" else UTS_TRACK[d["track_mode"]]
+    return ("🛠 Изменение турнира" if d.get("edit") else "🏁 Новый мини-УТС") + \
+        f"\n\nНазвание: {d['title']}\nРазмер: топ-{d['size']}\nЛузер-сетка: {'да' if d['de'] else 'нет'}\n" \
+        f"Старт: {when}\nТрасса: {track}\nФинал: до {(d['bo'] + 1) // 2} побед\nЕсли не наберёмся: {UTS_SHORT[d['short']]}\n\n" \
+        "Нажимай на кнопки, чтобы поменять. «Каждый с каждым» — если людей меньше, чем мест, все катаются со всеми."
+
+
+def uts_draft_kb(d):
+    when = {"keep": "как было"}.get(d["start"]) or UTS_START.get(d["start"]) or d["start"]
+    rows = [[{"text": f"👥 Топ-{d['size']}", "callback_data": "ut:d:size"},
+             {"text": f"🔻 Лузер-сетка: {'да' if d['de'] else 'нет'}", "callback_data": "ut:d:de"}],
+            [{"text": f"⏰ {when}", "callback_data": "ut:d:start"}, {"text": "✏️ Своё время", "callback_data": "ut:d:time"}],
+            [{"text": f"🗺 {UTS_TRACK[d['track_mode']]}", "callback_data": "ut:d:track"},
+             {"text": "✏️ Своя трасса", "callback_data": "ut:d:mytrack"}],
+            [{"text": f"🏆 Финал до {(d['bo'] + 1) // 2}", "callback_data": "ut:d:bo"},
+             {"text": f"⚠️ Неполный: {UTS_SHORT[d['short']]}", "callback_data": "ut:d:short"}],
+            [{"text": "✏️ Название", "callback_data": "ut:d:title"}]]
+    if d.get("edit"):
+        rows.append([{"text": "👤 Убрать участника", "callback_data": "ut:d:kick"},
+                     {"text": "🗑 Удалить турнир", "callback_data": "ut:d:del"}])
+    rows.append([{"text": "💾 Сохранить" if d.get("edit") else "✅ Создать", "callback_data": "ut:d:ok"},
+                 {"text": "✖️ Закрыть", "callback_data": "ut:d:no"}])
+    return {"inline_keyboard": rows}
+
+
+def uts_show_draft(chat_id, p):
+    d = p["uts_draft"]
+    if d.get("msg"):
+        api("editMessageText", {"chat_id": chat_id, "message_id": d["msg"], "text": uts_draft_text(d), "reply_markup": uts_draft_kb(d)})
+    else:
+        d["msg"] = api("sendMessage", {"chat_id": chat_id, "text": uts_draft_text(d), "reply_markup": uts_draft_kb(d)}
+                       ).get("result", {}).get("message_id")
+
+
+def uts_cmd(msg):
+    user = msg["from"]
+    if msg["chat"]["type"] != "private":
+        api("sendMessage", {"chat_id": msg["chat"]["id"], "text": "Турнир создаётся в личке бота — нажми кнопку ниже.",
+                            **({"message_thread_id": msg["message_thread_id"]} if msg.get("message_thread_id") else {}),
+                            "reply_markup": {"inline_keyboard": [[{"text": "🏁 Создать мини-УТС",
+                                                                   "url": f"https://t.me/{BOT_USERNAME}?start=uts"}]]}})
+        return
+    if not club_chat() or not settings.get(club_chat(), {}).get("duel_thread"):
+        reply(msg, "Турниры заработают, когда в чате клуба будет включён учёт дуэлей (/duelhere).")
+        return
+    if not can_have_profile(user):
+        reply(msg, "Создавать турниры могут пилоты из таблицы клуба.")
+        return
+    if uts_busy(user["id"]):
+        reply(msg, "Ты уже в турнире — сначала доиграй или выйди из него.")
+        return
+    p = profiles.setdefault(user["id"], {})
+    p.pop("await", None)
+    p["uts_draft"] = uts_new_draft()
+    uts_show_draft(msg["chat"]["id"], p)
+
+
+def uts_can_edit(t, uid):
+    return t["by"] == uid or get_level(club_chat(), uid) >= 2
+
+
+def uts_draft_callback(cq, act):
+    user, uid = cq["from"], cq["from"]["id"]
+    chat_id = (cq.get("message") or {}).get("chat", {}).get("id", uid)
+    p = profiles.setdefault(uid, {})
+    d = p.get("uts_draft")
+    if not d:
+        return "Это окно устарело — набери /uts ещё раз."
+    t = uts_all().get(d.get("edit", ""))
+    if act in ("kick", "del") and not t:
+        return "Это можно только у созданного турнира."
+    if d.get("edit") and (not t or t["state"] != "reg"):
+        p.pop("uts_draft", None)
+        return "Турнир уже начался или удалён — менять его нельзя."
+    if act == "size":
+        d["size"] = UTS_SIZES[(UTS_SIZES.index(d["size"]) + 1) % len(UTS_SIZES)]
+    elif act == "de":
+        d["de"] = not d["de"]
+    elif act == "start":
+        opts = (["keep"] if d.get("edit") else []) + list(UTS_START)
+        d["start"] = opts[(opts.index(d["start"]) + 1) % len(opts)] if d["start"] in opts else opts[0]
+    elif act == "track":
+        opts = list(UTS_TRACK)
+        d["track_mode"] = opts[(opts.index(d["track_mode"]) + 1) % len(opts)]
+        if d["track_mode"] == "fixed" and not d["track"]:
+            d["track_mode"] = "random"
+    elif act == "bo":
+        d["bo"] = 1 if d["bo"] == 3 else 3
+    elif act == "short":
+        opts = list(UTS_SHORT)
+        d["short"] = opts[(opts.index(d["short"]) + 1) % len(opts)]
+    elif act in ("time", "mytrack", "title"):
+        p["await"] = "uts_" + act
+        api("sendMessage", {"chat_id": chat_id, "text": {"time": "⏰ Напиши время старта по Москве, например 22:00.",
+                                                         "mytrack": "🗺 Напиши название трассы.",
+                                                         "title": "✏️ Напиши название турнира (до 40 символов)."}[act]})
+        return ""
+    elif act == "kick":
+        kb = [[{"text": f"❌ {uts_name(u)}", "callback_data": f"ut:k:{t['id']}:{u}"}] for u in t["players"] + t["reserve"] if u != uid]
+        api("sendMessage", {"chat_id": chat_id, "text": "Кого убрать из турнира?" if kb else "Кроме тебя, в турнире пока никого.",
+                            **({"reply_markup": {"inline_keyboard": kb}} if kb else {})})
+        return ""
+    elif act == "del":
+        uts_cancel(t, "организатор удалил его")
+        p.pop("uts_draft", None)
+        api("sendMessage", {"chat_id": chat_id, "text": "🗑 Турнир удалён."})
+        return ""
+    elif act == "no":
+        p.pop("uts_draft", None)
+        api("editMessageText", {"chat_id": chat_id, "message_id": d.get("msg"), "text": "Окно закрыто.", "reply_markup": {"inline_keyboard": []}})
+        return ""
+    elif act == "ok":
+        p.pop("uts_draft", None)
+        if t:
+            uts_apply_edit(t, d)
+            api("sendMessage", {"chat_id": chat_id, "text": "💾 Турнир изменён, участникам пришло уведомление."})
+        else:
+            if uts_busy(uid):
+                return "Ты уже в турнире."
+            t = uts_create(uid, d)
+            api("sendMessage", {"chat_id": chat_id, "text": f"✅ Турнир «{t['title']}» создан и опубликован в чате клуба. "
+                                                            "Ты уже в списке. Изменить: кнопка «⚙️ Изменить» под анонсом."})
+        return ""
+    uts_show_draft(chat_id, p)
+    return ""
+
+
+def uts_draft_text_input(msg, p):
+    kind, text = p.pop("await"), msg.get("text", "").strip()
+    d = p.get("uts_draft")
+    if not d:
+        return
+    if kind == "uts_time":
+        if uts_parse_time(text) is None:
+            reply(msg, "Не понял время. Напиши так: 22:00")
+            p["await"] = kind
+            return
+        d["start"] = re.sub(r"\.", ":", text.strip())
+    elif kind == "uts_mytrack":
+        d["track"], d["track_mode"] = text[:40], "fixed"
+    else:
+        d["title"] = text[:40]
+    d.pop("msg", None)
+    uts_show_draft(msg["chat"]["id"], p)
+
+
+def uts_apply_edit(t, d):
+    t.update(title=d["title"], de=d["de"], bo=d["bo"], short=d["short"], track_mode=d["track_mode"])
+    if d["track_mode"] == "fixed":
+        t["track"] = d["track"]
+    elif d["track_mode"] == "random" and not t.get("track"):
+        t["track"] = uts_random_track()
+    elif d["track_mode"] == "each":
+        t["track"] = ""
+    if d["start"] != "keep":
+        now = time.time()
+        if d["start"] == "now":
+            t["start"], t["deadline"] = None, now + UTS_REG_MIN * 60
+        elif d["start"] in UTS_START:
+            t["start"] = t["deadline"] = now + int(d["start"]) * 60
+        else:
+            t["start"] = t["deadline"] = uts_parse_time(d["start"])
+        t.pop("reminded", None)
+        t.pop("checking", None)
+    t["size"] = d["size"]
+    while len(t["players"]) > t["size"]:
+        t["reserve"].insert(0, t["players"].pop())
+    while len(t["players"]) < t["size"] and t["reserve"]:
+        t["players"].append(t["reserve"].pop(0))
+    uts_dm([u for u in t["players"] + t["reserve"] if u != t["by"]], f"🛠 Турнир «{t['title']}» изменён:\n\n{uts_reg_text(t)}")
+    uts_refresh(t)
+    if not t.get("start") and len(t["players"]) >= t["size"]:
+        uts_begin(t)
+
+
+def uts_callback(cq):
+    parts = cq["data"].split(":")
+    user, uid = cq["from"], cq["from"]["id"]
+    answer = lambda text="", alert=False: api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": text, "show_alert": alert})
+    act = parts[1]
+    if act == "d":
+        res = uts_draft_callback(cq, parts[2])
+        answer(res, bool(res))
+        return
+    t = uts_all().get(parts[2]) if len(parts) > 2 else None
+    if not t:
+        answer("Этого турнира уже нет.", True)
+        return
+    if act == "j":
+        answer(uts_join(t, user), True)
+    elif act == "x":
+        answer(uts_leave(t, uid), True)
+    elif act == "c":
+        if uid in t["players"] and uid not in t["checkin"]:
+            t["checkin"].append(uid)
+        answer("👍 Отлично, ты на месте!", True)
+    elif act == "e":
+        if not uts_can_edit(t, uid):
+            answer("Менять турнир может только организатор.", True)
+            return
+        if t["state"] != "reg":
+            answer("Турнир уже идёт — менять его нельзя.", True)
+            return
+        p = profiles.setdefault(uid, {})
+        p["uts_draft"] = {"edit": t["id"], "size": t["size"], "de": t["de"], "start": "keep", "track_mode": t["track_mode"],
+                          "track": t.get("track", ""), "bo": t["bo"], "short": t["short"], "title": t["title"]}
+        uts_show_draft(uid, p)
+        answer("Настройки турнира — в личке бота.")
+    elif act == "k":
+        if not uts_can_edit(t, uid) or t["state"] != "reg":
+            answer("Нельзя.", True)
+            return
+        who = int(parts[3])
+        uts_leave(t, who)
+        uts_dm([who], f"Организатор убрал тебя из турнира «{t['title']}».")
+        answer(f"{uts_name(who)} убран(а) из турнира.")
+    elif act == "s":
+        m = uts_m(t, parts[3])
+        if not m or m["done"] or uid not in (m["pa"], m["pb"]):
+            answer("Это не твой матч.", True)
+            return
+        uts_result(t, m, m["pb"] if uid == m["pa"] else m["pa"], f" — {uts_name(uid)} сдался(ась)")
+        answer("Ты сдался(ась).")
+    elif act == "r":
+        if uid not in t.get("seeds", []):
+            answer("Реванш может позвать только участник турнира.", True)
+            return
+        if uts_busy(uid):
+            answer("Ты уже в другом турнире.", True)
+            return
+        d = {"size": t["size"], "de": t["de"], "start": "now", "track_mode": t["track_mode"], "track": t.get("track", ""),
+             "bo": t["bo"], "short": t["short"], "title": t["title"] + " · реванш"}
+        others = [u for u in t["seeds"] if u != uid]
+        nt = uts_create(uid, d, [uid] + others)
+        uts_dm([u for u in nt["players"] if u != uid], f"🔁 {uts_name(uid)} позвал(а) на реванш «{t['title']}» — ты уже записан(а). "
+                                                       "Не можешь — нажми «Выйти» под анонсом в чате.")
+        answer("Реванш создан!", True)
+    else:
+        answer()
+
+
+# --- таймеры: напоминания, чек-ин, автоотмена, техпоражения ---
+def uts_tick(now):
+    if not club_chat():
+        return False
+    active = False
+    for t in list(uts_all().values()):
+        active = True
+        if t["state"] == "reg":
+            start = t.get("start")
+            if start and not t.get("reminded") and now >= start - UTS_REMIND_MIN * 60 and start - t["created"] > (UTS_REMIND_MIN + 5) * 60:
+                t["reminded"] = 1
+                uts_dm(t["players"], f"⏰ Турнир «{t['title']}» начнётся через {UTS_REMIND_MIN} мин ({msk_hm(start)} МСК).")
+            if start and not t.get("checking") and now >= start - UTS_CHECKIN_MIN * 60 and start - t["created"] > UTS_CHECKIN_MIN * 120:
+                t["checking"] = 1
+                uts_dm(t["players"], f"✋ Турнир «{t['title']}» через {UTS_CHECKIN_MIN} мин. Ты на месте? Нажми кнопку — "
+                                     "иначе место отдадим запасному.",
+                       {"inline_keyboard": [[{"text": "✅ Я на месте", "callback_data": f"ut:c:{t['id']}"}]]})
+            if now >= t["deadline"]:
+                uts_deadline(t)
+        elif t["state"] == "run":
+            uts_timers(t, now)
+        elif now - t.get("ended", now) > UTS_KEEP_DONE_H * 3600:
+            uts_all().pop(t["id"], None)
+    return active
+
+
+def uts_deadline(t):
+    if t.get("checking"):
+        gone = [u for u in t["players"] if u not in t["checkin"]]
+        for u in gone:
+            t["players"].remove(u)
+        while len(t["players"]) < t["size"] and t["reserve"]:
+            t["players"].append(t["reserve"].pop(0))
+        if gone:
+            uts_dm(gone, f"Ты не отметился(ась) в турнире «{t['title']}» — место отдали другому.")
+    n = len(t["players"])
+    if n >= t["size"] or (n >= 3 and t["short"] != "cancel"):
+        uts_begin(t)
+    else:
+        uts_cancel(t, f"за отведённое время набралось {n} из {t['size']}")
+
+
+def uts_timers(t, now):
+    for m in t["matches"]:
+        if m["done"] or not m.get("open") or m["id"].startswith("R"):
+            continue
+        if not m.get("pinged") and now - m["open"] > UTS_PING_MIN * 60:
+            m["pinged"] = 1
+            uts_post(f"⏳ {m['name']}: {uts_tag(m['pa'])} и {uts_tag(m['pb'])}, ждём скрин! Через {UTS_TECH_MIN - UTS_PING_MIN} мин — техническое поражение.")
+        elif now - m["open"] > UTS_TECH_MIN * 60:
+            # Скрина нет — проходит тот, кто выше в посеве
+            winner = min((m["pa"], m["pb"]), key=lambda u: t["seeds"].index(u))
+            uts_result(t, m, winner, " — техническая победа (скрина не было)")
+            return
+    if t.get("fmt") == "rr" and not t.get("final") and now - t["began"] > UTS_RR_MAX_MIN * 60:
+        for m in t["matches"]:
+            if not m["done"]:
+                m.update(done=True, skip=True)
+        uts_post(f"⏱ {t['title']}: время кругового этапа вышло, несыгранные матчи не считаются.")
+        uts_advance(t)
+
+
+# --- для приложения ---
+def uts_json():
+    chat = club_chat()
+    if not chat:
+        return {"active": [], "hist": [], "trophies": {}}
+    tag = lambda u: (members.get(chat, {}).get(u, {}).get("username") or "").lower()
+    who = lambda u: {"name": uts_name(u), "tg": tag(u)} if u else None
+    active = []
+    for t in sorted(uts_all().values(), key=lambda x: x["created"], reverse=True):
+        v = {k: t.get(k) for k in ("id", "title", "size", "de", "bo", "short", "track", "track_mode", "start", "deadline", "state", "fmt")}
+        v.update(by=uts_name(t["by"]), players=[who(u) for u in t["players"]], reserve=[who(u) for u in t["reserve"]],
+                 places=[who(u) for u in t.get("places", [])],
+                 matches=[{"id": m["id"], "name": m["name"], "a": who(m["pa"]), "b": who(m["pb"]), "sa": m["sa"], "sb": m["sb"],
+                           "done": m["done"], "w": who(m["w"]), "bye": bool(m.get("bye")), "open": bool(m.get("open")),
+                           "track": m.get("track", ""), "bo": m["bo"]} for m in t["matches"]])
+        if t.get("fmt") == "rr" and t["state"] != "reg":
+            order, table = uts_standings(t)
+            v["table"] = [[uts_name(u), table[u][0], round(table[u][1], 1)] for u in order]
+        active.append(v)
+    hist = settings.get(chat, {}).get("uts_hist", [])
+    trophies = {}
+    for h in hist:
+        for i, u in enumerate(h["places"][:3]):
+            key = tag(u) or uts_name(u)
+            trophies.setdefault(key, [0, 0, 0, uts_name(u)])[i] += 1  # [золото, серебро, бронза, ник в игре]
+    return {"active": active, "trophies": trophies,
+            "hist": [{"title": h["title"], "d": h["d"], "n": h["n"], "places": [uts_name(u) for u in h["places"]]} for h in reversed(hist[-20:])]}
+
+
+def uts_week_champion(chat_id, start, end):
+    a, b = start.isoformat(), end.isoformat()
+    wins = {}
+    for h in settings.get(chat_id, {}).get("uts_hist", []):
+        if a <= h["d"] <= b and h["places"]:
+            wins[h["places"][0]] = wins.get(h["places"][0], 0) + 1
+    if not wins:
+        return ""
+    best = max(wins, key=lambda u: wins[u])
+    return f"🏁 Чемпион недели по мини-УТС — {uts_name(best)}: {wins[best]} " + ("победа" if wins[best] == 1 else "победы" if wins[best] < 5 else "побед")
+
+
+def uts_api(init, tid, act):
+    user = webapp_user(init)
+    if not user:
+        return {"ok": False, "error": "Записаться из приложения можно, только когда оно открыто в Телеграме"}
+    t = uts_all().get(str(tid))
+    if not t:
+        return {"ok": False, "error": "Турнира уже нет"}
+    if not user.get("username"):  # бот знает @ник по чату клуба
+        user["username"] = members.get(club_chat(), {}).get(user.get("id"), {}).get("username", "")
+    res = uts_join(t, user) if act == "join" else uts_leave(t, user["id"])
+    return {"ok": True, "text": res}
+
+
 DM_TEST_TEXT = ("✅ Тест: бот может писать вам в ЛС.\n"
                 "Сюда по понедельникам будет приходить список не выполнивших норму с кнопками варна, "
                 "а также сигналы о возможной накрутке дуэлей.")
@@ -2881,6 +3671,8 @@ def scheduler_tick(now):
                 monday_summary(chat_id, now)
                 livery_of_week(chat_id, now)
                 changed = True
+        if uts_tick(time.time()):  # турниры: напоминания, чек-ин, автоотмена, техпоражения
+            changed = True
         if changed:
             save_state()
         if time.time() - _auto["backup"] > 6 * 3600:
@@ -2894,7 +3686,7 @@ def scheduler_loop():
             scheduler_tick(msk_now())
         except Exception as e:
             print("Ошибка планировщика:", repr(e))
-        time.sleep(300)
+        time.sleep(60)  # раз в минуту: таймеры турниров (остальное срабатывает по своим отметкам)
 
 
 HELP_TEXT = """📖 Команды бота
@@ -2949,6 +3741,7 @@ HELP_TEXT = """📖 Команды бота
 /livery — ливрейщикам, в ЛС бота: загрузить ливрею в «Мастерскую ливрей» приложения
 /liveryhere — написать в нужной теме: туда бот будет публиковать новые ливреи и «Ливрею недели»
 /order — в ЛС бота: заказать ливрею у ливрейщика клуба
+/uts — мини-УТС: создать турнир (топ-4…32, с лузер-сеткой или на вылет), запись — кнопкой «Участвую»
 
 🤖 Сам бот: в пятницу 18:00 напоминает тем, у кого меньше половины нормы, в понедельник 10:00 подводит
 итоги недели. Админам в ЛС приходит список не выполнивших норму с кнопками варна и сигналы о возможной
@@ -3060,6 +3853,9 @@ def handle(msg):
     if cmd == "livery" or (cmd == "start" and not is_group and args[:1] == ["livery"]):
         livery_cmd(msg)
         return
+    if cmd == "uts" or (cmd == "start" and not is_group and args[:1] == ["uts"]):
+        uts_cmd(msg)
+        return
     if cmd == "order" or (cmd == "start" and not is_group and args and args[0].startswith("order_")):
         if is_group:
             reply(msg, f"Ливрею заказывают в личке бота: напиши @{BOT_USERNAME} команду /order.")
@@ -3118,13 +3914,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
-        if self.path.startswith("/api/like"):
-            # Лайк ливреи из мини-приложения. Тело — JSON {init, id} простым текстом (без лишнего CORS-запроса)
+        if self.path.startswith(("/api/like", "/api/uts")):
+            # Лайк ливреи или запись на турнир из мини-приложения. Тело — JSON простым текстом (без лишнего CORS-запроса)
             with LOCK:
                 try:
                     req = json.loads(body or b"{}")
                     load_state()
-                    res = like_livery(req.get("init"), req.get("id"))
+                    res = (uts_api(req.get("init"), req.get("id"), req.get("act")) if self.path.startswith("/api/uts")
+                           else like_livery(req.get("init"), req.get("id")))
                     if res.get("ok"):
                         save_state()
                 except Exception as e:
