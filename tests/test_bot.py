@@ -491,31 +491,99 @@ check("tiny compressed photo detected", bot.small_photo({"photo": [{"width": 90,
       and not bot.small_photo({"photo": [{"width": 1280, "height": 591}]}) and not bot.small_photo({"document": {}}), [])
 
 # ---------- мастерская ливрей: владелец назначает ливрейщика, тот грузит ливреи в ЛС ----------
+import hmac, hashlib, time, urllib.parse
+btns = lambda c: [b for m, p in c for row in (p or {}).get("reply_markup", {}).get("inline_keyboard", []) for b in row]
 c = dm(USER, text="/livery"); check("livery only for designers", "только ливрейщики" in texts(c), [])
 c = dm(ADMIN, text="/designer @ivan"); check("only owner appoints designers", "только владелец" in texts(c), [])
 r = send(OWNER, "/designer @nobody"); check("unknown designer", "Не нашёл" in said(r), r)
 r = send(OWNER, "/designer @ivan")
 check("owner appoints designer", "теперь ливрейщик" in said(r) and any(p["chat_id"] == USER and "/livery" in p["text"] for c2, p in r if c2 == "sendMessage"), r)
-c = dm(USER, text="/livery"); check("designer menu", "мастерская ливрей" in texts(c).lower() and any("lv:add" in json.dumps(p.get("reply_markup", {})) for m, p in c), [])
-c = tap(USER, "lv:add"); check("asks for livery photo", "Пришли скрин ливреи" in texts(c), [])
-c = dm(USER, photo=[{"file_id": "s"}, {"file_id": "lv1"}]); check("asks for description", "опиши ливрею" in texts(c).lower(), [])
+c = dm(USER, text="/livery"); check("designer menu", "мастерская ливрей" in texts(c).lower() and any(b["callback_data"] == "lv:add" for b in btns(c)), [])
+c = tap(USER, "lv:add"); check("asks for livery photos", "до 5 скринов" in texts(c), [])
+c = dm(USER, photo=[{"file_id": "s"}, {"file_id": "lv1"}])
+check("photo counter with done button", "Фото: 1 из 5" in texts(c) and any(b["callback_data"] == "lv:done" for b in btns(c)), [])
+c = dm(USER, photo=[{"file_id": "lv1b"}])
+check("album photos update one message", any(m == "editMessageText" and "Фото: 2 из 5" in p["text"] for m, p in c), [])
+c = tap(USER, "lv:done"); check("asks for description", "опиши ливрею" in texts(c).lower(), [])
 c = dm(USER, text="Неоновая KHR на S15"); check("asks for whom", "Для кого" in texts(c), [])
 c = dm(USER, text="@petya"); bot.load_state()
-check("livery saved", "добавлена в портфолио" in texts(c), [])
+check("livery saved with publish button", "добавлена в портфолио" in texts(c) and any(b["callback_data"].startswith("lv:pub:") for b in btns(c)), [])
+car_btn = next((b["callback_data"] for m, p in c if m == "sendPhoto" and p["chat_id"] == USER2 for b in btns([(m, p)])), "")
+owner_btn = next((b["callback_data"] for m, p in c if m == "sendPhoto" and p["chat_id"] == OWNER for b in btns([(m, p)])), "")
+check("pilot gets livery made for him", car_btn.startswith("lvcar:"), [])
+check("owner notified about new livery", owner_btn.startswith("lvrm:"), [])
 des = [d for d in bot.liveries_json() if d["tg"] == "ivan"]
-check("livery in app data", des and des[0]["items"][0]["t"] == "Неоновая KHR на S15" and des[0]["items"][0]["for"] == "Petya"
-      and "f" not in des[0]["items"][0], [("sendMessage", {"text": str(des)})])
-lid = des[0]["items"][0]["id"]
-check("livery photo served", bot.livery_photo_bytes(lid) == b"\xff\xd8fakejpeg" and bot.livery_photo_bytes(1) is None, [])
+it0 = des[0]["items"][0] if des else {}
+check("livery in app data", it0.get("t") == "Неоновая KHR на S15" and it0.get("for") == "Petya" and it0.get("n") == 2
+      and "fs" not in it0 and "f" not in it0, [("sendMessage", {"text": str(des)})])
+lid = it0.get("id")
+check("livery photos served", bot.livery_photo_bytes(lid) == b"\xff\xd8fakejpeg" and bot.livery_photo_bytes(f"{lid}-1") == b"\xff\xd8fakejpeg"
+      and bot.livery_photo_bytes(f"{lid}-2") is None and bot.livery_photo_bytes(1) is None, [])
 check("designers in duels json", any(d["tg"] == "ivan" for d in bot.duels_json()["designers"]), [])
-tap(USER, "lv:add"); dm(USER, photo=[{"file_id": "lv2"}]); dm(USER, text="Ливрея клуба")
+# пилот ставит ливрею в профиль
+c = tap(ADMIN, car_btn); check("only that pilot can use livery as car", any(p.get("show_alert") for m, p in c if m == "answerCallbackQuery"), [])
+c = tap(USER2, car_btn); bot.load_state()
+check("livery set as car photo", bot.profiles[USER2].get("car") == "lv1" and any(m == "sendPhoto" and "новое фото машины" in p["caption"] for m, p in c), [])
+# публикация в чат клуба, в выбранной теме
+r = send(ADMIN, "/liveryhere", message_thread_id=555); check("liveryhere", "в этой теме" in said(r), r)
+c = tap(USER, f"lv:pub:{lid}")
+check("livery posted to club chat", any(m == "sendMediaGroup" and p["chat_id"] == CHAT and len(p["media"]) == 2 and p.get("message_thread_id") == 555
+                                          for m, p in c), [])
+c = tap(USER, f"lv:pub:{lid}"); check("posted only once", any(p.get("show_alert") for m, p in c if m == "answerCallbackQuery"), [])
+# вторая ливрея — ни для кого
+tap(USER, "lv:add"); dm(USER, photo=[{"file_id": "lv2"}]); tap(USER, "lv:done"); dm(USER, text="Ливрея клуба")
 c = tap(USER, "lv:skip"); bot.load_state()
 items = [d for d in bot.liveries_json() if d["tg"] == "ivan"][0]["items"]
 check("livery for nobody", "добавлена" in texts(c) and items[0]["t"] == "Ливрея клуба" and items[0]["for"] == "", [])
+lid2 = items[0]["id"]
 c = dm(USER, text="обычный текст"); check("plain text after save not captured", "добавлена" not in texts(c), [])
-c = tap(USER, "lv:list"); check("livery list", any("lv:del:" in json.dumps(p.get("reply_markup", {})) for m, p in c), [])
-c = tap(USER, f"lv:del:{lid}"); bot.load_state()
-check("livery deleted", "удалена" in texts(c) and len([d for d in bot.liveries_json() if d["tg"] == "ivan"][0]["items"]) == 1, [])
+# редактирование
+c = tap(USER, "lv:list"); check("livery list", any(b["callback_data"] == f"lv:item:{lid}" for b in btns(c)), [])
+c = tap(USER, f"lv:item:{lid}"); check("livery item menu", any(b["callback_data"] == f"lv:et:{lid}" for b in btns(c)), [])
+tap(USER, f"lv:et:{lid}"); c = dm(USER, text="Неон S15 v2"); bot.load_state()
+check("edit description", "обновлено" in texts(c) and bot.find_livery(lid)[1]["t"] == "Неон S15 v2", [])
+tap(USER, f"lv:ef:{lid}"); c = dm(USER, text="-"); bot.load_state()
+check("edit for whom", bot.find_livery(lid)[1]["for"] == "", [])
+tap(USER, f"lv:ep:{lid}"); dm(USER, photo=[{"file_id": "lv9"}]); c = tap(USER, f"lv:epd:{lid}"); bot.load_state()
+check("replace photos", "заменены" in texts(c) and bot.find_livery(lid)[1]["fs"] == ["lv9"], [])
+# лайки из приложения: только с настоящей подписью Телеграма
+def init_for(uid, bad=False):
+    pairs = {"auth_date": str(int(time.time())), "user": json.dumps({"id": uid, "first_name": "x"})}
+    secret = hmac.new(b"WebAppData", b"1:x", hashlib.sha256).digest()
+    h = hmac.new(secret, "\n".join(f"{k}={v}" for k, v in sorted(pairs.items())).encode(), hashlib.sha256).hexdigest()
+    return urllib.parse.urlencode(dict(pairs, hash="0" * 64 if bad else h))
+bot.load_state(); res = bot.like_livery(init_for(USER2), lid); bot.save_state()
+check("like", res == {"ok": True, "n": 1, "liked": True}, [("sendMessage", {"text": str(res)})])
+check("fake like rejected", not bot.like_livery(init_for(USER2, bad=True), lid)["ok"] and not bot.like_livery("", lid)["ok"], [])
+check("own livery not liked", not bot.like_livery(init_for(USER), lid)["ok"], [])
+res = bot.like_livery(init_for(USER2), lid); res2 = bot.like_livery(init_for(USER2), lid); bot.save_state()
+check("like toggles", res["n"] == 0 and not res["liked"] and res2["n"] == 1, [])
+check("likes in app data", [d for d in bot.liveries_json() if d["tg"] == "ivan"][0]["items"][1]["likes"] == 1, [])
+calls.clear(); bot.load_state(); bot.livery_of_week(CHAT, _dt.datetime.combine(mon + _dt.timedelta(days=7), _dt.time(10, 5)))
+check("livery of the week", any(m == "sendPhoto" and "Ливрея недели" in p["caption"] and p.get("message_thread_id") == 555 for m, p in calls),
+      [(m, p) for m, p in calls if m in ("sendPhoto", "sendMessage")])
+calls.clear(); bot.livery_of_week(CHAT, _dt.datetime.combine(mon + _dt.timedelta(days=21), _dt.time(10, 5)))
+check("no livery of the week without likes", not any(m in ("sendPhoto", "sendMediaGroup") for m, p in calls), [])
+# заказ ливреи
+c = dm(USER2, text="/order"); check("order lists designers", any(b["callback_data"] == f"lvo:to:{USER}" for b in btns(c)), [])
+c = tap(USER2, f"lvo:to:{USER}"); check("order asks details", "Опиши" in texts(c), [])
+c = dm(USER2, text="S15, чёрно-красная, к пятнице")
+ok_btn = next((b["callback_data"] for m, p in c if m == "sendMessage" and p["chat_id"] == USER for b in btns([(m, p)]) if b["callback_data"].startswith("lvo:ok:")), "")
+check("order delivered to designer", ok_btn and "Заказ отправлен" in texts(c) and any("к пятнице" in p.get("text", "") for m, p in c if p.get("chat_id") == USER), [])
+c = tap(MOD, ok_btn); check("only that designer answers order", any(p.get("show_alert") for m, p in c if m == "answerCallbackQuery"), [])
+c = tap(USER, ok_btn); check("designer takes order", any(p.get("chat_id") == USER2 and "взял(а) твой заказ" in p.get("text", "") for m, p in c), [])
+c = tap(USER, ok_btn); check("order answered once", "уже ответил" in texts(c), [])
+c = dm(USER2, text="/start order_ivan"); check("order deep link from app", "Опиши" in texts(c), [])
+c = dm(USER2, text="Ещё одна")
+no_btn = next((b["callback_data"] for m, p in c for b in btns([(m, p)]) if b["callback_data"].startswith("lvo:no:")), "")
+c = tap(USER, no_btn); check("designer declines order", any(p.get("chat_id") == USER2 and "не может" in p.get("text", "") for m, p in c), [])
+c = dm(USER, text="/start order_ivan"); check("cannot order from yourself", "Себе" in texts(c), [])
+# владелец убирает ливрею
+c = tap(ADMIN, owner_btn); check("only owner removes liveries", any(p.get("show_alert") for m, p in c if m == "answerCallbackQuery"), [])
+c = tap(OWNER, owner_btn, caption="ливрея"); bot.load_state()
+check("owner removes livery", bot.find_livery(lid)[1] is None and any(p.get("chat_id") == USER and "убрал ливрею" in p.get("text", "") for m, p in c), [])
+c = tap(USER, f"lv:del:{lid2}"); bot.load_state()
+check("livery deleted", "удалена" in texts(c) and not [d for d in bot.liveries_json() if d["tg"] == "ivan"][0]["items"], [])
 c = tap(ADMIN, "lv:add"); check("non-designer cannot press livery buttons", any(p.get("show_alert") for m, p in c if m == "answerCallbackQuery"), [])
 r = send(OWNER, "/designer"); check("designer list", "Иван" in said(r), r)
 r = send(OWNER, "/designer @ivan off"); bot.load_state()
