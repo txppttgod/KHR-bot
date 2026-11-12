@@ -906,7 +906,9 @@ DUEL_PROMPT = (
     "Верни JSON. is_duel_history — true только если это именно такой экран. opponent — ник соперника "
     "из «vs ...» ровно как написано. rows — все строки, которые видны целиком: date в формате ГГГГ-ММ-ДД, "
     "result: win, loss или draw, score — два числа через « / » как на экране, track — конфигурация. "
-    "Не придумывай строки, которых не видно, и не пропускай видимые."
+    "Не придумывай строки, которых не видно, и не пропускай видимые. "
+    "unreadable — true, если на экране есть строки, которые не удалось прочитать уверенно: "
+    "обрезаны, размыты, слишком мелкие или перекрыты."
 )
 DUEL_SCHEMA = {
     "type": "OBJECT",
@@ -919,6 +921,7 @@ DUEL_SCHEMA = {
             "score": {"type": "STRING"},
             "track": {"type": "STRING"},
         }, "required": ["date", "result", "score"]}},
+        "unreadable": {"type": "BOOLEAN"},
     },
     "required": ["is_duel_history", "rows"],
 }
@@ -1095,6 +1098,12 @@ def duel_image(msg):
     if doc.get("mime_type", "").startswith("image/") and doc.get("file_size", 0) < 15_000_000:
         return doc["file_id"], doc["mime_type"]
     return None, None
+
+
+def small_photo(msg):
+    # Телеграм сжал скрин так сильно, что мелкие цифры могут не прочитаться (файлом без сжатия такого не бывает)
+    big = (msg.get("photo") or [{}])[-1]
+    return bool(msg.get("photo")) and 0 < min(big.get("width", 0), big.get("height", 0)) < 500
 
 
 def is_duel_report(msg):
@@ -1443,6 +1452,9 @@ def duel_report_text(chat_id, user, s):
             lines.append(f"…и ещё {len(items) - 25}")
     if s["bad"]:
         lines.append(f"Не похоже на «Историю заездов»: {s['bad']} скрин.")
+    if s.get("blurry"):
+        lines.append(f"⚠️ Плохо читается: {s['blurry']} скрин. Часть строк могла не попасть в отчёт — "
+                     "пришли этот скрин ещё раз файлом (без сжатия). Повторы бот не посчитает.")
     for e in s["errors"]:
         lines.append("⚠️ " + e)
     status = "✅ норма выполнена" if week >= norm else f"осталось {norm - week}"
@@ -1511,6 +1523,8 @@ def apply_duel(msg, res, err):
         s["added"] += a
         s["dup"] += d
         s["skip"] += k
+        if res.get("unreadable") or small_photo(msg):
+            s["blurry"] = s.get("blurry", 0) + 1
         print(f"Дуэли {name_of(user)}: {res.get('opponent')} +{a}, повторов {d}, вне срока {k}")
         for other, opp, n in alerts:
             o = members.get(chat_id, {}).get(other, {"first_name": str(other)})
@@ -1694,7 +1708,7 @@ def duels_json():
         load_state()
         start, end = week_bounds()
         pstart, pend = week_bounds(back=1)
-        norm, pilots = DUEL_NORM_DEFAULT, {}
+        norm, pilots, names = DUEL_NORM_DEFAULT, {}, club_names()
         for chat_id, people in duels.items():
             norm = get_norm(chat_id)
             for uid, lst in people.items():
@@ -1705,12 +1719,17 @@ def duels_json():
                 p["week"] += duels_in(chat_id, uid, start, end)
                 p["prev"] += duels_in(chat_id, uid, pstart, pend)
                 p["total"] += len(lst)
+                p["streak"] = norm_streak(chat_id, uid, norm)
+                p["stats"] = pilot_stats(counted(chat_id, uid, names))
+        club = club_chat()
+        awards = {"week": week_awards(club, start, end, names), "prev": week_awards(club, pstart, pend, names)} if club else {}
         # Профили: есть ли фото машины (v — версия, чтобы сайт подхватил новое фото) и подпись
         prof = {(p.get("username") or "").lower(): {"photo": p.get("v", 0) if p.get("car") else 0,
                                                     "about": p.get("about", "")}
                 for p in profiles.values() if p.get("username") and (p.get("car") or p.get("about"))}
         return {"week": week_label(start, end), "prev_week": week_label(pstart, pend), "norm": norm,
-                "pilots": pilots, "profiles": prof, "tracks": tracks_json()}
+                "pilots": pilots, "profiles": prof, "tracks": tracks_json(), "awards": awards,
+                "rivalries": rivalries(club, names) if club else []}
 
 
 def tracks_json():
@@ -1721,9 +1740,129 @@ def tracks_json():
     fresh = chat_id not in tracks
     start, end = week_bounds()
     out = {"week": tracks_top(chat_id, start, end), "all": tracks_top(chat_id)}
+    out["kings"] = map_kings(chat_id)
     if fresh:
         save_state()  # счётчик «за всё время» только что заполнили из сданных дуэлей — запоминаем
     return out
+
+
+# ---------- Статистика для приложения: личные цифры, короли карт, награды недели, серии, соперничества ----------
+# Всё считается только по дуэлям, которые идут в норму, и только за то время, что бот хранит дуэли (10 недель).
+AWARD_MIN = 10  # «Снайпер недели» — только у кого хотя бы столько дуэлей за неделю
+
+
+def counted(chat_id, uid, names, start=None, end=None):
+    a, b = (start.isoformat() if start else ""), (end.isoformat() if end else "9999")
+    return [d for d in duels.get(chat_id, {}).get(uid, []) if a <= d["d"] <= b and not why_not_counted(d, names)]
+
+
+def pilot_name(chat_id, uid):
+    return game_name(chat_id, uid) or members.get(chat_id, {}).get(uid, {}).get("first_name", "")
+
+
+def norm_streak(chat_id, uid, norm, today=None):
+    # Сколько недель подряд выполнена норма: от прошлой недели назад до первой невыполненной.
+    # Текущая неделя добавляется, только когда норма на ней уже выполнена (иначе серия не обнуляется до понедельника).
+    n = 1 if duels_in(chat_id, uid, *week_bounds(today)) >= norm else 0
+    for back in range(1, DUEL_KEEP_DAYS // 7 + 1):
+        if duels_in(chat_id, uid, *week_bounds(today, back=back)) < norm:
+            break
+        n += 1
+    return n
+
+
+def pilot_stats(lst):
+    # Личные цифры для профиля: победы, лучший счёт, любимая карта, с кем катает чаще всего
+    maps, riv = {}, {}
+    for d in lst:
+        if d.get("t"):
+            maps.setdefault(track_key(d["t"]), [d["t"].strip(), 0])[1] += 1
+        r = riv.setdefault(d["o"].strip().lower(), [d["o"].strip(), 0, 0, 0])  # [ник, дуэлей, побед, поражений]
+        r[1] += 1
+        r[2] += d["r"] == "win"
+        r[3] += d["r"] == "loss"
+    return {"n": len(lst), "w": sum(d["r"] == "win" for d in lst), "l": sum(d["r"] == "loss" for d in lst),
+            "best": max((own_score(d["s"]) for d in lst), default=0),
+            "map": max(maps.values(), key=lambda x: x[1])[0] if maps else "",
+            "rivals": sorted(riv.values(), key=lambda x: (-x[1], x[0].lower()))[:3]}
+
+
+def club_uids(chat_id):
+    # Пилоты по порядку ника — чтобы при равенстве награды и короли не прыгали между обновлениями
+    return sorted(duels.get(chat_id, {}), key=lambda uid: pilot_name(chat_id, uid).lower())
+
+
+def week_awards(chat_id, start, end, names=None):
+    names = club_names() if names is None else names
+    out = {}
+    for uid in club_uids(chat_id):
+        lst = counted(chat_id, uid, names, start, end)
+        who = pilot_name(chat_id, uid)
+        if not lst or not who:
+            continue
+        n, w = len(lst), sum(d["r"] == "win" for d in lst)
+        if n > out.get("active", ["", 0])[1]:
+            out["active"] = [who, n]
+        if n >= AWARD_MIN:
+            pct, cur = round(w / n * 100), out.get("sniper")
+            if not cur or (pct, n) > (cur[1], cur[2]):
+                out["sniper"] = [who, pct, n]
+        for d in lst:
+            sc = score_pair(d["s"])
+            if sc and sc[0] > out.get("record", ["", 0])[1]:
+                out["record"] = [who, sc[0], d.get("t", ""), d["o"]]
+            # Дуэль недели — самая близкая по счёту, где оба по-настоящему проехали
+            if sc and min(sc) >= MIN_SCORE and d["r"] == "win":
+                gap = round(abs(sc[0] - sc[1]), 1)
+                if "closest" not in out or gap < out["closest"][4]:
+                    out["closest"] = [who, d["o"], sc[0], sc[1], gap, d.get("t", ""), d["d"]]
+    return out
+
+
+def map_kings(chat_id, names=None):
+    # Король карты — у кого больше всех побед на ней (при равенстве — меньше поражений)
+    names = club_names() if names is None else names
+    best = {}
+    for uid in club_uids(chat_id):
+        who = pilot_name(chat_id, uid)
+        if not who:
+            continue
+        per = {}
+        for d in counted(chat_id, uid, names):
+            if d.get("t"):
+                p = per.setdefault(track_key(d["t"]), [0, 0])
+                p[0] += d["r"] == "win"
+                p[1] += d["r"] == "loss"
+        for k, (w, l) in per.items():
+            if w and (k not in best or (w, -l) > (best[k][1], best[k][2])):
+                best[k] = [who, w, -l]
+    return {k: [v[0], v[1]] for k, v in best.items()}
+
+
+def rivalries(chat_id, names=None, limit=5):
+    # Пары пилотов клуба, которые чаще всего катают друг с другом, и личный счёт между ними.
+    # Одна дуэль лежит у обоих пилотов (у соперника — по отчёту первого), поэтому считаем её один раз.
+    names = club_names() if names is None else names
+    seen, pairs = set(), {}
+    for uid in club_uids(chat_id):
+        me = pilot_name(chat_id, uid)
+        if not me:
+            continue
+        for d in counted(chat_id, uid, names):
+            opp = d["o"].strip()
+            if opp.lower() not in names or opp.lower() == me.lower():
+                continue
+            key = (d["d"], tuple(sorted((me.lower(), opp.lower()))), tuple(sorted(score_pair(d["s"]) or ())))
+            if key in seen:
+                continue
+            seen.add(key)
+            a, b = sorted((me, opp), key=str.lower)
+            p = pairs.setdefault((a.lower(), b.lower()), [a, b, 0, 0, 0])  # [пилот A, пилот B, побед A, побед B, дуэлей]
+            p[4] += 1
+            if d["r"] in ("win", "loss"):
+                a_won = (d["r"] == "win") == (me.lower() == a.lower())
+                p[2 if a_won else 3] += 1
+    return sorted(pairs.values(), key=lambda p: (-p[4], p[0].lower()))[:limit]
 
 
 def sheet_payload(chat_id):
@@ -1780,6 +1919,7 @@ def sync_sheet(chat_id):
 # ---------- Автоматика: напоминания, итоги недели, сообщения админам, резервная копия ----------
 REMIND_DAY, REMIND_HOUR = 4, 18    # пятница 18:00 МСК — напоминание тем, у кого меньше половины нормы
 SUMMARY_DAY, SUMMARY_HOUR = 0, 10  # понедельник 10:00 МСК — итоги прошлой недели
+NUDGE_DAY, NUDGE_HOUR = 3, 18      # четверг 18:00 МСК — личное напоминание в ЛС тем, кто не добрал норму
 _auto = {"ping": 0, "backup": 0}
 
 
@@ -1834,6 +1974,35 @@ def friday_reminder(chat_id, now):
                     + "\n\nСкрины «История заездов» кидайте сюда.")
 
 
+def thursday_nudge(chat_id, now):
+    # Личное напоминание в ЛС тем, кто отстаёт от нормы. Дойдёт только до тех, кто хоть раз нажал Start у бота.
+    start, end = week_bounds(now.date())
+    norm, left_days = get_norm(chat_id), (end - now.date()).days + 1
+    sent = 0
+    for n, p in norm_rows(chat_id, start, end):
+        if p["uid"] and n < norm:
+            text = (f"🏁 {p['name']}, на этой неделе у тебя {n} из {norm} дуэлей — осталось {norm - n}.\n"
+                    f"До конца недели {left_days} дн. (до воскресенья включительно).\n"
+                    "Скрины «История заездов» кидай в тему отчётов клуба.")
+            sent += bool(api("sendMessage", {"chat_id": p["uid"], "text": text}).get("ok"))
+    print(f"Напоминание о норме в ЛС: доставлено {sent}")
+
+
+def awards_text(aw):
+    lines = []
+    if aw.get("active"):
+        lines.append(f"🔥 Самый активный — {aw['active'][0]}: {aw['active'][1]} дуэл.")
+    if aw.get("sniper"):
+        lines.append(f"🎯 Снайпер — {aw['sniper'][0]}: {aw['sniper'][1]}% побед из {aw['sniper'][2]} дуэл.")
+    if aw.get("record"):
+        r = aw["record"]
+        lines.append(f"🚀 Рекорд — {r[0]}: {r[1]:g} балла" + (f" на {r[2]}" if r[2] else ""))
+    if aw.get("closest"):
+        c = aw["closest"]
+        lines.append(f"⚔️ Дуэль недели — {c[0]} vs {c[1]}: {c[2]:g} / {c[3]:g}, разница {c[4]:g}" + (f" ({c[5]})" if c[5] else ""))
+    return "\n".join(lines)
+
+
 def monday_summary(chat_id, now):
     start, end = week_bounds(now.date(), back=1)
     norm = get_norm(chat_id)
@@ -1845,7 +2014,17 @@ def monday_summary(chat_id, now):
         text += "\n\n" + "\n".join(f"✅ {p['name']} — {n}" for n, p in done)
     if fail:
         text += "\n\n" + "\n".join(f"❌ {p['name']} — {n}/{norm}" for n, p in fail)
+    aw = awards_text(week_awards(chat_id, start, end))
+    if aw:
+        text += "\n\n🏆 Награды недели\n" + aw
     post_to_reports(chat_id, text)
+    # Кто две недели подряд не сдал ни одной дуэли — админам в ЛС отдельным списком
+    p2start, p2end = week_bounds(now.date(), back=2)
+    idle = [p for n, p in rows if n == 0 and (not p["uid"] or duels_in(chat_id, p["uid"], p2start, p2end) == 0)]
+    if idle:
+        dm_admins(chat_id, f"😴 Две недели подряд ({week_label(p2start, p2end)} и {week_label(start, end)}) "
+                           f"ни одной дуэли в норму: {len(idle)}\n" + "\n".join(f"• {p['name']}" + (f" @{p['tg']}" if p["tg"] else "")
+                                                                               for p in idle))
     if not fail:
         return
     # Варны не выдаём сами: админ решает, у кого уважительная причина
@@ -2146,6 +2325,10 @@ def scheduler_tick(now):
             if now.weekday() == REMIND_DAY and now.hour >= REMIND_HOUR and conf.get("reminded") != week:
                 conf["reminded"] = week
                 friday_reminder(chat_id, now)
+                changed = True
+            if now.weekday() == NUDGE_DAY and now.hour >= NUDGE_HOUR and conf.get("nudged") != week:
+                conf["nudged"] = week
+                thursday_nudge(chat_id, now)
                 changed = True
             if now.weekday() == SUMMARY_DAY and now.hour >= SUMMARY_HOUR and conf.get("summarized") != week:
                 conf["summarized"] = week
