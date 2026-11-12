@@ -1567,6 +1567,9 @@ def handle_callback(cq):
     if data.startswith(("ml:", "mlx:")):
         maplogo_callback(cq)
         return
+    if data.startswith("lv:"):
+        livery_callback(cq)
+        return
     msg = cq.get("message") or {}
     chat_id = (msg.get("chat") or {}).get("id")
     if not data.startswith("du:") or not chat_id:
@@ -1729,7 +1732,7 @@ def duels_json():
                 for p in profiles.values() if p.get("username") and (p.get("car") or p.get("about"))}
         return {"week": week_label(start, end), "prev_week": week_label(pstart, pend), "norm": norm,
                 "pilots": pilots, "profiles": prof, "tracks": tracks_json(), "awards": awards,
-                "rivalries": rivalries(club, names) if club else []}
+                "rivalries": rivalries(club, names) if club else [], "designers": liveries_json()}
 
 
 def tracks_json():
@@ -2196,6 +2199,9 @@ def profile_photo_message(msg):
     if str(p.get("await", "")).startswith("maplogo:"):
         maplogo_photo(msg, p["await"].split(":", 1)[1])
         return
+    if p.get("await") == "livery":
+        livery_photo(msg)
+        return
     if p.get("await") != "car":
         reply(msg, "Чтобы поставить фото машины в профиль, набери /myprofile и нажми «🚗 Фото машины».")
         return
@@ -2211,6 +2217,9 @@ def profile_text_message(msg):
     # Текст в личке бота, когда человек пишет «о себе». Возвращает True, если сообщение забрали.
     p = profiles.get(msg["from"]["id"], {})
     text = msg.get("text", "").strip()
+    if p.get("await") in ("lv_title", "lv_for") and text and not text.startswith("/"):
+        livery_text(msg, p)
+        return True
     if p.get("await") != "about" or text.startswith("/"):
         p.pop("await", None) if text.startswith("/") else None
         return False
@@ -2264,6 +2273,198 @@ def profile_photo(username):
         while len(_photo_cache) > 80:
             _photo_cache.pop(next(iter(_photo_cache)))
     return data
+
+
+# ---------- Мастерская ливрей: портфолио ливрейщиков клуба ----------
+# Ливрейщика назначает владелец (/designer @ник) — или он сам им становится, если в таблице пилотов
+# или в должностях бота (/setrole) у него есть «ливре…». Ливреи он загружает в ЛС бота (/livery),
+# а приложение показывает их на странице «Мастерская ливрей». Хранятся в профиле: profiles[uid]["liveries"].
+LIVERY_MAX = 40       # сколько ливрей в портфолио одного ливрейщика
+LIVERY_TITLE_MAX = 150
+LIVERY_FOR_MAX = 40
+_livery_cache = {}    # id ливреи → (file_id, байты)
+
+
+def is_designer(user):
+    chat_id = club_chat()
+    if not chat_id or not user:
+        return False
+    if user["id"] in settings.get(chat_id, {}).get("designers", []):
+        return True
+    own = roles.get(chat_id, {}).get(user["id"], [])
+    r = find_pilot(user.get("username") or "") if user.get("username") else None
+    return any("ливре" in x.lower() for x in own + ([col(r, 6)] if r else []))
+
+
+def club_user_by_name(name):
+    # Участник клуба по @нику в Телеграме (бот знает тех, кто писал в чат клуба)
+    uname = name.lower().lstrip("@")
+    return next((dict(u) for u in members.get(club_chat(), {}).values() if (u.get("username") or "").lower() == uname), None)
+
+
+def cmd_designer(msg, args):
+    # /designer — список, /designer @ник — назначить ливрейщиком, /designer @ник off — снять
+    if not is_owner(msg["from"]["id"]):
+        reply(msg, "Назначать ливрейщиков может только владелец клуба.")
+        return
+    conf = settings.setdefault(club_chat(), {})
+    lst = conf.setdefault("designers", [])
+    if not args:
+        names = [name_of(members.get(club_chat(), {}).get(uid, {"first_name": str(uid)})) for uid in lst]
+        reply(msg, "🎨 Ливрейщики: " + (", ".join(names) if names else "пока никого") +
+              "\nНазначить: /designer @ник · снять: /designer @ник off\n"
+              "Ещё ливрейщиком считается тот, у кого в таблице пилотов или в /setrole есть должность «Дизайнер ливрей».")
+        return
+    target = (msg.get("reply_to_message") or {}).get("from") or club_user_by_name(args[0])
+    if not target:
+        reply(msg, f"Не нашёл {args[0]} в чате клуба. Человек должен хоть раз написать в чат, тогда бот его узнает.")
+        return
+    who = name_of(target) + (f" @{target['username']}" if target.get("username") else "")
+    if args[-1].lower() in ("off", "выкл", "снять"):
+        if target["id"] in lst:
+            lst.remove(target["id"])
+        reply(msg, f"Снял с {who} статус ливрейщика. Его ливреи больше не показываются в приложении"
+              + (" (но должность «ливре…» в таблице или /setrole всё ещё даёт доступ)." if is_designer(target) else "."))
+        return
+    if target["id"] not in lst:
+        lst.append(target["id"])
+    reply(msg, f"🎨 {who} теперь ливрейщик клуба. Загружать ливреи — в ЛС бота командой /livery.")
+    api("sendMessage", {"chat_id": target["id"],
+                        "text": "🎨 Тебя назначили ливрейщиком клуба KHR!\nТеперь у тебя есть своя страница в приложении клуба "
+                                "(«Мастерская ливрей»). Загружай туда свои работы: /livery"})
+
+
+def livery_menu(chat_id, text):
+    kb = [[{"text": "➕ Новая ливрея", "callback_data": "lv:add"}],
+          [{"text": "📂 Мои ливреи", "callback_data": "lv:list"}]]
+    api("sendMessage", {"chat_id": chat_id, "text": text, "reply_markup": {"inline_keyboard": kb}})
+
+
+def livery_cmd(msg):
+    user = msg["from"]
+    if msg["chat"]["type"] != "private":
+        reply(msg, f"Ливреи загружаются в личке бота: напиши @{BOT_USERNAME} команду /livery.")
+        return
+    if not is_designer(user):
+        reply(msg, "Загружать ливреи могут только ливрейщики клуба. Их назначает владелец.")
+        return
+    p = profiles.setdefault(user["id"], {})
+    p.pop("await", None)
+    p["username"] = user.get("username", "")
+    n = len(p.get("liveries", []))
+    livery_menu(msg["chat"]["id"], f"🎨 Твоя мастерская ливрей — {n} из {LIVERY_MAX} работ.\n"
+                                   "Всё, что сюда загрузишь, видно в приложении клуба на странице «Мастерская ливрей».")
+
+
+def livery_callback(cq):
+    user, uid = cq["from"], cq["from"]["id"]
+    chat_id = (cq.get("message") or {}).get("chat", {}).get("id", uid)
+    answer = lambda text="", alert=False: api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": text,
+                                                                      "show_alert": alert})
+    if not is_designer(user):
+        answer("Загружать ливреи могут только ливрейщики клуба.", True)
+        return
+    p = profiles.setdefault(uid, {})
+    p["username"] = user.get("username", "")
+    items = p.setdefault("liveries", [])
+    parts = cq["data"].split(":")
+    if parts[1] == "add":
+        if len(items) >= LIVERY_MAX:
+            answer(f"В портфолио уже {LIVERY_MAX} ливрей — сначала удали старые в «📂 Мои ливреи».", True)
+            return
+        p["await"] = "livery"
+        p.pop("lv_new", None)
+        api("sendMessage", {"chat_id": chat_id, "text": "🖼 Пришли скрин ливреи одним фото (лучше файлом — без сжатия)."})
+    elif parts[1] == "list":
+        if not items:
+            api("sendMessage", {"chat_id": chat_id, "text": "Пока пусто. Нажми «➕ Новая ливрея» в /livery."})
+        else:
+            kb = [[{"text": f"🗑 {it['t'][:40]}", "callback_data": f"lv:del:{it['id']}"}] for it in items[-30:]]
+            api("sendMessage", {"chat_id": chat_id, "reply_markup": {"inline_keyboard": kb},
+                                "text": f"📂 Твои ливреи: {len(items)}. Нажми на ливрею, чтобы удалить её из портфолио."})
+    elif parts[1] == "del":
+        keep = [it for it in items if str(it["id"]) != parts[2]]
+        if len(keep) == len(items):
+            answer("Эту ливрею уже удалили.")
+            return
+        p["liveries"] = keep
+        api("sendMessage", {"chat_id": chat_id, "text": "🗑 Ливрея удалена из портфолио."})
+    elif parts[1] == "skip" and p.get("await") == "lv_for":
+        livery_save(chat_id, uid, p, "")
+    answer()
+
+
+def livery_photo(msg):
+    p = profiles.setdefault(msg["from"]["id"], {})
+    p["lv_new"] = {"f": duel_image(msg)[0]}
+    p["await"] = "lv_title"
+    reply(msg, f"📝 Теперь опиши ливрею одним сообщением (до {LIVERY_TITLE_MAX} символов): "
+               "название, машина, идея — что хочешь рассказать.")
+
+
+def livery_text(msg, p):
+    text = msg.get("text", "").strip()
+    if p["await"] == "lv_title":
+        p["lv_new"]["t"] = text[:LIVERY_TITLE_MAX]
+        p["await"] = "lv_for"
+        api("sendMessage", {"chat_id": msg["chat"]["id"],
+                            "text": "👤 Для кого эта ливрея? Напиши ник пилота (например, Fatcat или @fatcat).",
+                            "reply_markup": {"inline_keyboard": [[{"text": "Ни для кого / для клуба", "callback_data": "lv:skip"}]]}})
+    else:
+        livery_save(msg["chat"]["id"], msg["from"]["id"], p, text)
+
+
+def livery_save(chat_id, uid, p, for_whom):
+    new = p.pop("lv_new", None)
+    p.pop("await", None)
+    if not new or not new.get("f"):
+        api("sendMessage", {"chat_id": chat_id, "text": "Что-то пошло не так — начни заново: /livery"})
+        return
+    who = for_whom.strip().lstrip("@")
+    if who in ("-", "—"):
+        who = ""
+    # Если это пилот из таблицы — пишем его ник в игре, чтобы приложение открыло его профиль
+    r = next((r for r in get_pilots() if who and who.lower() in (col(r, 1).lower(), col(r, 2).lower().lstrip("@"))), None)
+    new["for"] = col(r, 1) if r else who[:LIVERY_FOR_MAX]
+    new["id"] = int(time.time() * 1000) % 10 ** 12
+    new["d"] = msk_today().isoformat()
+    new.setdefault("t", "")
+    p.setdefault("liveries", []).append(new)
+    api("sendMessage", {"chat_id": chat_id, "text": "✅ Ливрея добавлена в портфолио — она уже в приложении клуба. "
+                                                    "Ещё одну: /livery"})
+
+
+def liveries_json():
+    chat_id = club_chat()
+    out = []
+    # Ливрейщики — и те, кто уже что-то загрузил, и назначенные, у кого страница пока пустая
+    for uid in set(profiles) | set(members.get(chat_id, {})) | set(settings.get(chat_id, {}).get("designers", [])):
+        p = profiles.get(uid, {})
+        user = dict(members.get(chat_id, {}).get(uid, {}), id=uid)
+        if not user.get("username"):
+            user["username"] = p.get("username", "")
+        if not is_designer(user):
+            continue
+        r = find_pilot(user["username"]) if user.get("username") else None
+        out.append({"tg": (user.get("username") or "").lower(), "name": col(r, 1) if r else user.get("first_name", ""),
+                    "items": [{k: it.get(k, "") for k in ("id", "t", "for", "d")} for it in reversed(p.get("liveries", []))]})
+    return sorted(out, key=lambda x: (-len(x["items"]), x["name"].lower()))
+
+
+def livery_photo_bytes(lid):
+    for p in profiles.values():
+        it = next((it for it in p.get("liveries", []) if str(it["id"]) == str(lid)), None)
+        if it:
+            cached = _livery_cache.get(it["id"])
+            if cached and cached[0] == it["f"]:
+                return cached[1]
+            data = tg_file(it["f"])
+            if data:
+                _livery_cache[it["id"]] = (it["f"], data)
+                while len(_livery_cache) > 60:
+                    _livery_cache.pop(next(iter(_livery_cache)))
+            return data
+    return None
 
 
 DM_TEST_TEXT = ("✅ Тест: бот может писать вам в ЛС.\n"
@@ -2398,6 +2599,8 @@ HELP_TEXT = """📖 Команды бота
 /duelhere — написать в теме отчётов: бот начнёт считать там дуэли (off — выключить)
 /setnorm 20 — норма дуэлей в неделю
 /maplogo — только владелец, в ЛС бота: логотипы карт для рейтинга карт в приложении
+/designer @ник — только владелец: назначить ливрейщика (/designer @ник off — снять)
+/livery — ливрейщикам, в ЛС бота: загрузить ливрею в «Мастерскую ливрей» приложения
 
 🤖 Сам бот: в пятницу 18:00 напоминает тем, у кого меньше половины нормы, в понедельник 10:00 подводит
 итоги недели. Админам в ЛС приходит список не выполнивших норму с кнопками варна и сигналы о возможной
@@ -2502,6 +2705,12 @@ def handle(msg):
     if cmd == "maplogo":
         maplogo_menu(msg)
         return
+    if cmd == "designer":
+        cmd_designer(msg, args)
+        return
+    if cmd == "livery" or (cmd == "start" and not is_group and args[:1] == ["livery"]):
+        livery_cmd(msg)
+        return
 
     if cmd in ADMIN_CMDS:
         if is_group:
@@ -2573,12 +2782,12 @@ class Handler(BaseHTTPRequestHandler):
             save_state()
 
     def do_GET(self):
-        if self.path.startswith(("/photo/", "/maplogo/")):
-            # Фото машины пилота (/photo/<@ник>) или логотип карты (/maplogo/<трасса>) для приложения
-            is_logo = self.path.startswith("/maplogo/")
+        if self.path.startswith(("/photo/", "/maplogo/", "/livery/")):
+            # Фото машины пилота (/photo/<@ник>), логотип карты (/maplogo/<трасса>) или ливрея (/livery/<id>) для приложения
+            kind = self.path.split("/", 2)[1]
             name = self.path.split("/", 2)[2].split("?")[0]
             try:
-                data = map_logo(unquote(name)) if is_logo else profile_photo(unquote(name))
+                data = {"maplogo": map_logo, "livery": livery_photo_bytes}.get(kind, profile_photo)(unquote(name))
             except Exception as e:
                 print("Ошибка /photo:", repr(e))
                 data = None
