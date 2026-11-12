@@ -436,6 +436,59 @@ check("logo marked in list", any(b[0]["text"].startswith("🖼 Ebisu West") for 
 tap(OWNER, f"ml:{idx}"); c = tap(OWNER, f"mlx:{idx}"); bot.load_state()
 check("logo removed", "убран" in texts(c) and bot.map_logo("ebisu west") is None, [])
 c = dm(OWNER, photo=[{"file_id": "x"}]); check("after removal photo is not taken as logo", "Логотип" not in texts(c), [])
+
+# ---------- статистика пилота, награды недели, короли карт, серии, соперничества ----------
+bot.load_state(); j = bot.duels_json(); st = j["pilots"]["ernest"]["stats"]
+check("pilot stats in app data", st["n"] >= 5 and st["w"] >= 5 and st["best"] == 171.3 and st["map"]
+      and st["rivals"][0][0] == "Petya", [("sendMessage", {"text": str(st)})])
+aw = j["awards"]["week"]
+check("award: most active", aw["active"][0] == "Ernest", [("sendMessage", {"text": str(aw)})])
+check("award: record", aw["record"][:2] == ["Ernest", 171.3], [("sendMessage", {"text": str(aw)})])
+check("award: closest duel only where both really drove", aw["closest"][:2] == ["Ernest", "Petya"] and aw["closest"][4] == 14.7,
+      [("sendMessage", {"text": str(aw)})])
+check("no sniper below minimum duels", "sniper" not in aw, [])
+bot.AWARD_MIN = 3
+aw3 = bot.week_awards(CHAT, *wk)
+check("award: sniper", aw3["sniper"][:2] == ["Ernest", 100], [("sendMessage", {"text": str(aw3)})])
+bot.AWARD_MIN = 10
+check("map king", j["tracks"]["kings"].get("ebisu west", [""])[0] == "Ernest", [("sendMessage", {"text": str(j["tracks"]["kings"])})])
+riv = j["rivalries"][0]
+mine_vs = [d for d in bot.counted(CHAT, OWNER, bot.club_names()) if d["o"] == "Petya"]
+theirs_vs = [d for d in bot.counted(CHAT, USER2, bot.club_names()) if d["o"] == "Ernest"]
+check("rivalry counts each duel once", riv[:2] == ["Ernest", "Petya"] and max(len(mine_vs), len(theirs_vs)) <= riv[4] < len(mine_vs) + len(theirs_vs)
+      and riv[2] + riv[3] <= riv[4] and riv[2] > riv[3], [("sendMessage", {"text": str(j["rivalries"])})])
+check("streak", bot.norm_streak(CHAT, OWNER, 1) == 1 and bot.norm_streak(CHAT, OWNER, 50) == 0
+      and "streak" in j["pilots"]["ernest"], [])
+
+# ---------- четверг: напоминание в ЛС тем, кто не добрал норму ----------
+thu = _dt.datetime.combine(mon + _dt.timedelta(days=3), _dt.time(18, 30))
+bot.load_state(); bot.settings[CHAT].pop("nudged", None); bot.save_state()
+calls.clear(); bot.scheduler_tick(thu)
+nudges = [p for c, p in calls if c == "sendMessage" and "осталось" in p["text"] and p["chat_id"] in (OWNER, USER2)]
+check("thursday DM nudge", len(nudges) == 2 and "из 20 дуэлей" in nudges[0]["text"], [("sendMessage", p) for c, p in calls if c == "sendMessage"])
+calls.clear(); bot.scheduler_tick(thu + _dt.timedelta(hours=1))
+check("nudge once a week", not any(c == "sendMessage" and "осталось" in p["text"] for c, p in calls), [])
+
+# ---------- понедельник: награды в итогах и список неактивных админам ----------
+calls.clear(); bot.load_state(); bot.monday_summary(CHAT, _dt.datetime.combine(mon + _dt.timedelta(days=7), _dt.time(10, 5)))
+posts = [p for c, p in calls if c == "sendMessage"]
+check("awards in monday summary", any("🏆 Награды недели" in p["text"] and "⚔️ Дуэль недели — Ernest vs Petya" in p["text"] for p in posts),
+      [("sendMessage", p) for p in posts])
+check("active pilots not in idle list", not any("Две недели подряд" in p["text"] and ("Ernest" in p["text"] or "Petya" in p["text"]) for p in posts),
+      [("sendMessage", p) for p in posts])
+calls.clear(); bot.monday_summary(CHAT, _dt.datetime.combine(mon + _dt.timedelta(days=28), _dt.time(10, 5)))
+idle = [p for c, p in calls if c == "sendMessage" and "Две недели подряд" in p["text"]]
+check("idle pilots to admins in DM", len(idle) == 2 and "Ernest" in idle[0]["text"] and all(p["chat_id"] in (OWNER, ADMIN) for p in idle),
+      [("sendMessage", p) for c, p in calls if c == "sendMessage"])
+
+# ---------- плохо читаемый скрин: просим прислать файлом ----------
+GEM["answer"] = {"is_duel_history": True, "opponent": "Petya", "unreadable": True,
+                 "rows": [{"date": iso(today), "result": "win", "score": "140.4 / 120.1", "track": "Dominion 2"}]}
+r = photo(OWNER); check("blurry screen asks for file", "Плохо читается" in said(r) and "файлом" in said(r), r)
+GEM["answer"]["unreadable"] = False; GEM["answer"]["rows"][0]["score"] = "141.4 / 120.1"
+r = photo(OWNER); check("clear screen has no warning", "Плохо читается" not in said(r), r)
+check("tiny compressed photo detected", bot.small_photo({"photo": [{"width": 90, "height": 40}, {"width": 960, "height": 443}]})
+      and not bot.small_photo({"photo": [{"width": 1280, "height": 591}]}) and not bot.small_photo({"document": {}}), [])
 print("\n".join(checks))
 failed = sum(c.startswith("FAIL") for c in checks)
 print("FAILED:", failed, "of", len(checks))
