@@ -1330,7 +1330,7 @@ def update_duel(chat_id, uid, ex, res, score):
     ex["s"], ex["r"] = score, res
 
 
-def add_duels(chat_id, uid, opponent, rows, group, items=None, alerts=None):
+def add_duels(chat_id, uid, opponent, rows, group, items=None, alerts=None, mid=None):
     # Возвращает (новых, повторов, вне срока). В items дописывает каждую строку скрина с её судьбой,
     # чтобы бот показал в ответе, что именно прочитал и куда засчитал.
     # Дуэль с участником клуба засчитывается обоим с первого же скрина: сопернику она пишется
@@ -1386,6 +1386,8 @@ def add_duels(chat_id, uid, opponent, rows, group, items=None, alerts=None):
         have.add(key)
         have.add((key[0], key[1], mirror(score)))
         rec = {"d": key[0], "o": opp, "r": res, "s": score, "t": (row.get("track") or "")[:40], "g": group}
+        if mid:
+            rec["m"] = mid  # сообщение со скрином — ссылка в приложении
         credited = False  # "" — сопернику не писали, "ok" — засчитана и ему, иначе причина, почему ему не в норму
         if opp_uid and opp_uid != uid and my_name:
             theirs = duels[chat_id].setdefault(opp_uid, [])
@@ -1398,6 +1400,8 @@ def add_duels(chat_id, uid, opponent, rows, group, items=None, alerts=None):
             else:
                 theirs_rec = {"d": rec["d"], "o": my_name, "r": OPPOSITE.get(res, res), "s": mirror(score),
                               "t": rec["t"], "g": group, "by": uid}
+                if mid:
+                    theirs_rec["m"] = mid
                 theirs.append(theirs_rec)
                 theirs.sort(key=lambda d: d["d"])
                 credited = why_not_counted(theirs_rec, names) or "ok"
@@ -1544,7 +1548,8 @@ def apply_duel(msg, res, err):
         before = len(s["items"])
         had = {id(x) for x in duels.get(chat_id, {}).get(user["id"], [])}
         elo_before, rec_before = elo_table(chat_id), map_records(chat_id)
-        a, d, k = add_duels(chat_id, user["id"], res.get("opponent"), res["rows"], group, s["items"], alerts)
+        a, d, k = add_duels(chat_id, user["id"], res.get("opponent"), res["rows"], group, s["items"], alerts,
+                            mid=msg["message_id"])
         try:
             duel_extras(chat_id, user["id"], [x for x in duels[chat_id].get(user["id"], []) if id(x) not in had],
                         elo_before, rec_before)
@@ -1564,6 +1569,10 @@ def apply_duel(msg, res, err):
             link = (f"\nСкрин: https://t.me/c/{cid}/" + (f"{msg['message_thread_id']}/" if msg.get("message_thread_id") else "")
                     + str(msg["message_id"])) if cid else ""
             print(f"Подозрение на накрутку: {who} и {name_of(o)}, vs {opp}, совпало {n}")
+            al = settings.setdefault(chat_id, {}).setdefault("alerts", [])
+            al.append({"d": msk_today().isoformat(), "who": who, "other": name_of(o), "opp": opp, "n": n,
+                       "uid": user["id"], "g": group, "link": link.replace("\nСкрин: ", "")})
+            del al[:-ALERTS_KEEP]
             dm_admins(chat_id, f"🚩 Возможная накрутка: {who} сдал(а) дуэли vs {opp}, которые уже сдал(а) "
                                f"{name_of(o)} — совпало {n} шт. (та же дата, тот же соперник, тот же счёт). "
                                f"Похоже на один и тот же скрин.{link}\nЕсли это так — отмени отчёт кнопкой под ответом бота.")
@@ -1639,6 +1648,20 @@ def handle_callback(cq):
     if deny:
         api("answerCallbackQuery", {"callback_query_id": cq["id"], "show_alert": True, "text": deny})
         return
+    removed = remove_report(chat_id, uid, group)
+    start, end = week_bounds()
+    week = duels_in(chat_id, uid, start, end)
+    text = (msg.get("text", "") + f"\n\n❌ Отменено ({name_of(clicker)}): снято дуэлей {removed}. "
+            f"Теперь за неделю: {week} из {get_norm(chat_id)}")
+    api("editMessageText", {"chat_id": chat_id, "message_id": msg["message_id"], "text": text,
+                            "reply_markup": {"inline_keyboard": []}})
+    api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": f"Снято дуэлей: {removed}"})
+    log_action({"chat": {"id": chat_id}, "from": clicker}, members.get(chat_id, {}).get(uid, {"id": uid}),
+               f"отменил отчёт по дуэлям (−{removed})")
+    schedule_sheet_sync(chat_id)
+
+
+def remove_report(chat_id, uid, group):
     mine = duels.get(chat_id, {}).get(uid, [])
     removed = sum(1 for d in mine if d.get("g") == group and not d.get("by"))
     for d in mine:
@@ -1650,16 +1673,7 @@ def handle_callback(cq):
     for other, lst in duels.get(chat_id, {}).items():
         if other != uid:
             duels[chat_id][other] = [d for d in lst if not (d.get("by") == uid and d.get("g") == group)]
-    start, end = week_bounds()
-    week = duels_in(chat_id, uid, start, end)
-    text = (msg.get("text", "") + f"\n\n❌ Отменено ({name_of(clicker)}): снято дуэлей {removed}. "
-            f"Теперь за неделю: {week} из {get_norm(chat_id)}")
-    api("editMessageText", {"chat_id": chat_id, "message_id": msg["message_id"], "text": text,
-                            "reply_markup": {"inline_keyboard": []}})
-    api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": f"Снято дуэлей: {removed}"})
-    log_action({"chat": {"id": chat_id}, "from": clicker}, members.get(chat_id, {}).get(uid, {"id": uid}),
-               f"отменил отчёт по дуэлям (−{removed})")
-    schedule_sheet_sync(chat_id)
+    return removed
 
 
 def duel_people(chat_id):
@@ -1787,7 +1801,8 @@ def duels_json():
                 "elo": elo_json(club, names) if club else [], "ach": ach_json(club) if club else {},
                 "ach_info": {k: list(v) for k, v in ACH.items()},
                 "lfg": [uts_name(int(k)) for k in settings.get(club, {}).get("dz", {}).get("lfg", {})] if club else [],
-                "elo_hist": elo_history(club, names) if club else {}, "teams": teams_json(club) if club else None}
+                "elo_hist": elo_history(club, names) if club else {}, "teams": teams_json(club) if club else None,
+                "shot_base": shot_base(club) if club else ""}
 
 
 def tracks_json():
@@ -1846,10 +1861,19 @@ def pilot_stats(lst):
         v[0] += 1
         v[1] += d["r"] == "win"
         v[2] += d["r"] == "loss"
-        v[3].append([d["d"], d["r"], d["s"], d.get("t", "")])
+        v[3].append([d["d"], d["r"], d["s"], d.get("t", ""), d.get("m", 0)])
     for v in vs.values():
         v[3] = v[3][-5:][::-1]
-    return {"vs": vs, "n": len(lst), "w": sum(d["r"] == "win" for d in lst), "l": sum(d["r"] == "loss" for d in lst),
+    per = {}  # карта → [название, дуэлей, побед]
+    for d in lst:
+        k = track_key(d.get("t"))
+        if k:
+            m = per.setdefault(k, [d["t"].strip(), 0, 0])
+            m[1] += 1
+            m[2] += d["r"] == "win"
+    return {"vs": vs, "maps": sorted(per.values(), key=lambda x: (-x[1], x[0].lower()))[:8],
+            "recent": [[d["d"], d["o"], d["r"], d["s"], d.get("t", ""), d.get("m", 0)] for d in lst[-10:][::-1]],
+            "n": len(lst), "w": sum(d["r"] == "win" for d in lst), "l": sum(d["r"] == "loss" for d in lst),
             "best": max((own_score(d["s"]) for d in lst), default=0),
             "map": max(maps.values(), key=lambda x: x[1])[0] if maps else "",
             "rivals": sorted(riv.values(), key=lambda x: (-x[1], x[0].lower()))[:3]}
@@ -4336,6 +4360,71 @@ def goals_report(chat_id, now):
         api("sendMessage", {"chat_id": int(uid), "text": text})
 
 
+# ---------- Админ-панель в приложении ----------
+# Данные только для админов клуба (уровень 2+): проверяем подпись Телеграма и уровень в чате.
+ALERTS_KEEP = 30
+
+
+def shot_base(chat_id):
+    # Начало ссылки на сообщение в теме отчётов: https://t.me/c/<чат>/<тема>/
+    cid = str(chat_id)[4:] if str(chat_id).startswith("-100") else ""
+    th = settings.get(chat_id, {}).get("duel_thread")
+    return f"https://t.me/c/{cid}/" + (f"{th}/" if th else "") if cid else ""
+
+
+def admin_reports(chat_id, limit=25):
+    groups = {}
+    for uid, lst in duels.get(chat_id, {}).items():
+        for d in lst:
+            if d.get("by"):
+                continue
+            g = groups.setdefault((uid, d.get("g", "")), {"uid": uid, "g": d.get("g", ""), "n": 0, "d": d["d"], "o": d["o"], "m": 0})
+            g["n"] += 1
+            g["d"] = max(g["d"], d["d"])
+            g["m"] = max(g["m"], d.get("m", 0) or 0)
+    rows = sorted(groups.values(), key=lambda x: (x["m"], x["d"]), reverse=True)[:limit]
+    return [{"who": pilot_name(chat_id, r["uid"]) or str(r["uid"]), "uid": r["uid"], "g": r["g"], "n": r["n"], "d": r["d"],
+             "o": r["o"], "m": r["m"]} for r in rows]
+
+
+def admin_json(chat_id):
+    norm, (start, end) = get_norm(chat_id), week_bounds()
+    pstart, pend = week_bounds(back=1)
+    people = []
+    for p in duel_people(chat_id):
+        week = duels_in(chat_id, p["uid"], start, end) if p["uid"] else 0
+        prev = duels_in(chat_id, p["uid"], pstart, pend) if p["uid"] else 0
+        last = max((d["d"] for d in duels.get(chat_id, {}).get(p["uid"], [])), default="") if p["uid"] else ""
+        people.append({"name": p["name"], "tg": p["tg"], "week": week, "prev": prev, "last": last, "known": bool(p["uid"])})
+    people.sort(key=lambda x: (x["week"], x["prev"], x["name"].lower()))
+    return {"norm": norm, "people": people, "reports": admin_reports(chat_id),
+            "alerts": list(reversed(settings.get(chat_id, {}).get("alerts", []))), "shot_base": shot_base(chat_id),
+            "unknown": [p["name"] + (" @" + p["tg"] if p["tg"] else "") for p in people if not p["known"]]}
+
+
+def admin_api(init, act, uid=None, group=None):
+    user = webapp_user(init)
+    chat_id = club_chat()
+    if not user or not chat_id:
+        return {"ok": False, "error": "Открой приложение в Телеграме"}
+    my = get_level(chat_id, user["id"])
+    if my < 2:
+        return {"ok": False, "error": "Админ-панель — только для администраторов клуба", "denied": True}
+    if act == "undo":
+        uid = int(uid)
+        if user["id"] != uid and get_level(chat_id, uid) >= my:
+            return {"ok": False, "error": "Отчёт администратора может отменить только владелец."}
+        removed = remove_report(chat_id, uid, str(group))
+        if not removed:
+            return {"ok": False, "error": "Этот отчёт уже отменён."}
+        who = members.get(chat_id, {}).get(uid, {"id": uid, "first_name": pilot_name(chat_id, uid) or str(uid)})
+        log_action({"chat": {"id": chat_id}, "from": user}, who, f"отменил отчёт по дуэлям (−{removed}) из приложения")
+        post_to_reports(chat_id, f"❌ {name_of(user)} отменил(а) отчёт {name_of(who)}: снято дуэлей {removed}.")
+        schedule_sheet_sync(chat_id)
+        return {"ok": True, "text": f"Снято дуэлей: {removed}"}
+    return {"ok": True, "data": admin_json(chat_id)}
+
+
 DM_TEST_TEXT = ("✅ Тест: бот может писать вам в ЛС.\n"
                 "Сюда по понедельникам будет приходить список не выполнивших норму с кнопками варна, "
                 "а также сигналы о возможной накрутке дуэлей.")
@@ -4676,7 +4765,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
-        if self.path.startswith(("/api/like", "/api/uts", "/api/duel")):
+        if self.path.startswith(("/api/like", "/api/uts", "/api/duel", "/api/admin")):
             # Лайк ливреи или запись на турнир из мини-приложения. Тело — JSON простым текстом (без лишнего CORS-запроса)
             with LOCK:
                 try:
@@ -4684,6 +4773,8 @@ class Handler(BaseHTTPRequestHandler):
                     load_state()
                     if self.path.startswith("/api/uts"):
                         res = uts_api(req.get("init"), req.get("id"), req.get("act"))
+                    elif self.path.startswith("/api/admin"):
+                        res = admin_api(req.get("init"), req.get("act"), req.get("uid"), req.get("g"))
                     elif self.path.startswith("/api/duel"):
                         res = duel_api(req.get("init"), req.get("act"), req.get("to"))
                     else:
