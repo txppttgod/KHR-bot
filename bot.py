@@ -2766,7 +2766,10 @@ def order_text(msg, p):
     text = msg.get("text", "").strip()[:ORDER_TEXT_MAX]
     user = msg["from"]
     orders = settings.setdefault(club_chat(), {}).setdefault("orders", [])
-    o = {"id": int(time.time() * 1000) % 10 ** 12, "from": user["id"], "to": to, "text": text, "st": "new", "d": msk_today().isoformat()}
+    oid, used = int(time.time() * 1000) % 10 ** 12, {x["id"] for x in orders}
+    while oid in used:  # два заказа в одну миллисекунду — номера не должны совпасть
+        oid += 1
+    o = {"id": oid, "from": user["id"], "to": to, "text": text, "st": "new", "d": msk_today().isoformat()}
     orders.append(o)
     del orders[:-100]
     who = name_of(user) + (f" @{user['username']}" if user.get("username") else "")
