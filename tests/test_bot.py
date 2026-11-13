@@ -869,6 +869,26 @@ r = shot(USER, OWNER, [True]); check("goal in report", any("🎯 Личная ц
 calls.clear(); bot.load_state(); bot.goals_report(CHAT, _dt.datetime.combine(today, _dt.time(10, 5)))
 check("goal weekly result in DM", any(p.get("chat_id") == USER and "Личная цель на неделю" in p.get("text", "") for m, p in calls), [])
 c = dm(USER, text="/goal off"); check("goal removed", "снята" in texts(c) and "goal" not in bot.duels_json()["pilots"]["ivan"], [])
+# ---------- статистика по картам, ссылки на скрины, админ-панель ----------
+r = tshot(USER, "Ernest", [("win", "170 / 160", "Ebisu Minami"), ("loss", "150 / 160", "Ebisu Minami"), ("win", "165 / 150", "Springstone")])
+shot_mid = mid[0]
+j = bot.duels_json(); st = j["pilots"]["ivan"]["stats"]
+check("map stats per pilot", ["Ebisu Minami", 2, 1] in [m for m in st["maps"] if m[0] == "Ebisu Minami"] or any(m[0] == "Ebisu Minami" and m[2] >= 1 for m in st["maps"]), [("sendMessage", {"text": str(st["maps"])})])
+check("screenshot link in recent duels", st["recent"][0][5] == shot_mid and j["shot_base"] == "https://t.me/c/1/83379/", [("sendMessage", {"text": str(st["recent"][:2]) + j["shot_base"]})])
+check("screenshot link in head to head", st["vs"]["ernest"][3][0][4] == shot_mid, [])
+check("opponent duel has link too", j["pilots"]["ernest"]["stats"]["recent"][0][5] == shot_mid, [])
+check("admin api rejects fake init", not bot.admin_api(init_for(OWNER, bad=True), "get")["ok"], [])
+res = bot.admin_api(init_for(USER), "get"); check("admin api only for admins", not res["ok"] and res.get("denied"), [])
+bot.load_state(); res = bot.admin_api(init_for(OWNER), "get")
+rep = next((x for x in res["data"]["reports"] if x["uid"] == USER and x["m"] == shot_mid), None) if res["ok"] else None
+check("admin panel data", res["ok"] and res["data"]["people"] and rep and rep["n"] == 3 and res["data"]["alerts"], [("sendMessage", {"text": str(res)[:300]})])
+own = next((x for x in res["data"]["reports"] if x["uid"] == OWNER), None)
+check("admin cannot undo owner report", own and not bot.admin_api(init_for(ADMIN), "undo", OWNER, own["g"])["ok"], [])
+calls.clear(); bot.load_state(); res = bot.admin_api(init_for(ADMIN), "undo", USER, rep["g"]); bot.save_state()
+check("admin undoes report from app", res["ok"] and "3" in res["text"] and "отменил(а) отчёт" in posts(calls)
+      and not any(d.get("g") == rep["g"] for d in bot.duels[CHAT].get(USER, [])), [("sendMessage", {"text": str(res) + posts(calls)})])
+check("undo also removes opponent copy", not any(d.get("g") == rep["g"] for d in bot.duels[CHAT].get(OWNER, [])), [])
+check("undo twice", not bot.admin_api(init_for(ADMIN), "undo", USER, rep["g"])["ok"], [])
 print("\n".join(checks))
 failed = sum(c.startswith("FAIL") for c in checks)
 print("FAILED:", failed, "of", len(checks))
