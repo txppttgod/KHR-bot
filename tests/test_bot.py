@@ -889,6 +889,18 @@ check("admin undoes report from app", res["ok"] and "3" in res["text"] and "от
       and not any(d.get("g") == rep["g"] for d in bot.duels[CHAT].get(USER, [])), [("sendMessage", {"text": str(res) + posts(calls)})])
 check("undo also removes opponent copy", not any(d.get("g") == rep["g"] for d in bot.duels[CHAT].get(OWNER, [])), [])
 check("undo twice", not bot.admin_api(init_for(ADMIN), "undo", USER, rep["g"])["ok"], [])
+# два заказа ливреи в одну миллисекунду получают разные номера
+_real_time = time.time
+time.time = lambda: 1700000000.123
+try:
+    bot.load_state()
+    for txt in ("A", "B"):
+        bot.order_text({"from": u(USER2), "chat": {"id": USER2, "type": "private"}, "message_id": 1, "text": txt}, {"await": f"order:{OWNER}"})
+    ids = [o["id"] for o in bot.settings[CHAT]["orders"][-2:]]
+finally:
+    time.time = _real_time
+bot.save_state()
+check("order ids unique within one millisecond", len(set(ids)) == 2, [("sendMessage", {"text": str(ids)})])
 print("\n".join(checks))
 failed = sum(c.startswith("FAIL") for c in checks)
 print("FAILED:", failed, "of", len(checks))
