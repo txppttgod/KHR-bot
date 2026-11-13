@@ -806,6 +806,69 @@ calls.clear(); bot.load_state(); bot.ach_update(CHAT); check("achievement announ
 j = bot.duels_json()
 check("achievements in app data", "w10" in dict(j["ach"]["ivan"]) and j["ach_info"]["w10"][1] == "10 побед подряд", [])
 r = send(MOD, "/norm"); check("norm still works", " из " in said(r), r)
+# ---------- шансы, апсеты, рекорды карт, история Эло, личные встречи, команды, прогнозы, пинг, цель ----------
+# мягкий пинг
+bot.load_state(); bot.duels[CHAT] = {MOD: [{"d": iso(today - dt.timedelta(days=5)), "o": "Ivan", "r": "win", "s": "150 / 140", "t": "", "g": "old"}]}
+bot.settings[CHAT].pop("pinged", None); bot.save_state()
+calls.clear(); bot.load_state(); bot.soft_ping(CHAT, _dt.datetime.combine(today, _dt.time(15, 5))); bot.save_state()
+check("soft ping after 3+ days", any(p.get("chat_id") == MOD and "не катал(а) дуэли уже 5 дн" in p.get("text", "") for m, p in calls)
+      and not any(p.get("chat_id") in (USER, OWNER) for m, p in calls), [])
+calls.clear(); bot.load_state(); bot.soft_ping(CHAT, _dt.datetime.combine(today, _dt.time(15, 5)))
+check("soft ping only once", not any(m == "sendMessage" for m, p in calls), [])
+# Эло: Ivan сильнее, потом апсет
+bot.load_state(); bot.duels[CHAT] = {}; bot.save_state()
+shot(USER, OWNER, [True] * 8)
+r = send(USER, "/call @ernest"); check("call shows elo odds", "Шансы по Эло: Ivan (" in said(r) and "Ernest (" in said(r), r)
+bot.load_state(); bot.settings[CHAT].pop("dz", None); bot.save_state()
+r = shot(OWNER, USER, [True])
+check("upset announced", any("Апсет! Ernest" in p.get("text", "") and "фаворита Ivan" in p.get("text", "") for m, p in r), r)
+r = shot(USER, OWNER, [True]); check("no upset when favourite wins", not any("Апсет" in p.get("text", "") for m, p in r), r)
+# рекорды карт
+def tshot(uid, opp, rows):
+    GEM["answer"] = {"is_duel_history": True, "opponent": opp,
+                     "rows": [{"date": iso(today), "result": res, "score": sc, "track": tr} for res, sc, tr in rows]}
+    return photo(uid)
+r = tshot(USER, "Petya", [("win", "170 / 160", "Ebisu Minami")]); check("first record on a map is quiet", not any("рекорд" in p.get("text", "") for m, p in r), r)
+r = tshot(MOD, "Ivan", [("win", "180.5 / 150", "Ebisu Minami")])
+check("new map record announced", any("Новый рекорд карты Ebisu Minami: Danya — 180.5 (был 170 у Ivan)" in p.get("text", "") for m, p in r), r)
+j = bot.duels_json()
+check("map records in app data", j["tracks"]["records"][bot.track_key("Ebisu Minami")][:2] == ["Danya", 180.5], [("sendMessage", {"text": str(j["tracks"].get("records"))})])
+bot.load_state(); elo = bot.elo_table(CHAT)
+check("elo history ends with current rating", j["elo_hist"]["ivan"][-1] == round(elo["ivan"][1]) and len(j["elo_hist"]["ivan"]) == 10, [("sendMessage", {"text": str(j["elo_hist"])})])
+vs = j["pilots"]["ivan"]["stats"]["vs"]["ernest"]
+check("head to head", vs[0] == 10 and vs[1] == 9 and vs[2] == 1 and len(vs[3]) == 5, [("sendMessage", {"text": str(vs)})])
+# командная неделя
+calls.clear(); bot.load_state(); t = bot.teams_make(CHAT, today); bot.save_state()
+check("teams split", t and len(t["a"]) == 2 and len(t["b"]) == 2 and "Командная неделя" in posts(calls) and "🔴 Красные" in posts(calls), [("sendMessage", {"text": posts(calls)})])
+r = send(USER2, "/teams"); tj = bot.duels_json()["teams"]
+check("teams score", "🔴 Красные" in said(r) and tj["pa"] + tj["pb"] == sum(x[1] for x in tj["a"] + tj["b"]) and tj["pa"] + tj["pb"] > 0, r)
+calls.clear(); bot.load_state(); bot.teams_finish(CHAT); bot.save_state()
+check("teams result", "Итог командной недели" in posts(calls), [("sendMessage", {"text": posts(calls)})])
+# прогнозы на мини-УТС
+bot.load_state(); bot.uts_all().clear(); bot.save_state()
+tidp, _ = create(USER)
+for x in (OWNER, MOD):
+    tap(x, f"ut:j:{tidp}")
+c = tap(USER2, f"ut:j:{tidp}")
+check("prediction poll on start", T(tidp)["state"] == "run" and any(b["callback_data"] == f"ut:p:{tidp}:{USER}" for b in btns(c)), [])
+c = tap(MOD, f"ut:p:{tidp}:{USER}"); check("predict", "Твой прогноз: Ivan" in texts(c), [])
+tap(OWNER, f"ut:p:{tidp}:{MOD}")
+c = tap(6, f"ut:p:{tidp}:{USER}"); check("guest cannot predict", "пилоты из таблицы" in texts(c), [])
+c = tick(16); check("predictions close", any(m == "editMessageReplyMarkup" for m, p in c), [])
+bot.load_state(); bot.uts_all()[tidp]["pred_until"] = time.time() - 1; bot.save_state()
+c = tap(USER2, f"ut:p:{tidp}:{USER}"); check("late prediction rejected", "закрыты" in texts(c), [])
+calls.clear(); bot.load_state(); tp = bot.uts_all()[tidp]; tp["places"] = [USER, OWNER]; bot.uts_pred_finish(tp); bot.save_state()
+check("prophets scored", "угадали Danya" in posts(calls) and bot.uts_json()["prophets"] == [["Danya", 1]], [("sendMessage", {"text": posts(calls)})])
+bot.load_state(); bot.uts_all().clear(); bot.save_state()
+# личная цель
+c = dm(USER, text="/goal 30"); check("goal set", "Цель — 30" in texts(c), [])
+c = dm(6, text="/goal 30"); check("guest cannot set goal", "пилоты из таблицы" in texts(c), [])
+c = dm(USER, text="/start goal"); check("goal menu", any(b["callback_data"] == "gl:40" for b in btns(c)), [])
+c = tap(USER, "gl:40"); check("goal by button", "Цель — 40" in texts(c) and bot.duels_json()["pilots"]["ivan"]["goal"] == 40, [])
+r = shot(USER, OWNER, [True]); check("goal in report", any("🎯 Личная цель:" in p.get("text", "") for m, p in r), r)
+calls.clear(); bot.load_state(); bot.goals_report(CHAT, _dt.datetime.combine(today, _dt.time(10, 5)))
+check("goal weekly result in DM", any(p.get("chat_id") == USER and "Личная цель на неделю" in p.get("text", "") for m, p in calls), [])
+c = dm(USER, text="/goal off"); check("goal removed", "снята" in texts(c) and "goal" not in bot.duels_json()["pilots"]["ivan"], [])
 print("\n".join(checks))
 failed = sum(c.startswith("FAIL") for c in checks)
 print("FAILED:", failed, "of", len(checks))
