@@ -984,6 +984,21 @@ def duels_in(chat_id, uid, start, end):
     return sum(1 for d in duels.get(chat_id, {}).get(uid, []) if a <= d["d"] <= b and not why_not_counted(d, names))
 
 
+def duels_word(n):
+    n = abs(n) % 100
+    return "дуэлей" if 11 <= n <= 14 else {1: "дуэль", 2: "дуэли", 3: "дуэли", 4: "дуэли"}.get(n % 10, "дуэлей")
+
+
+def pace(left, days):
+    # Подсказка по темпу: сколько дуэлей в день нужно, чтобы закрыть норму до воскресенья
+    if left <= 0 or days <= 0:
+        return ""
+    if days == 1:
+        return f"все {left} — сегодня"
+    per = -(-left // days)
+    return f"это по {per} {duels_word(per)} в день"
+
+
 def norm_score(s):
     nums = re.findall(r"\d+(?:[.,]\d+)?", s or "")
     return " / ".join(n.replace(",", ".") for n in nums[:2])
@@ -1460,7 +1475,8 @@ def duel_report_text(chat_id, user, s):
                      "пришли этот скрин ещё раз файлом (без сжатия). Повторы бот не посчитает.")
     for e in s["errors"]:
         lines.append("⚠️ " + e)
-    status = "✅ норма выполнена" if week >= norm else f"осталось {norm - week}"
+    hint = pace(norm - week, (end - msk_today()).days + 1)
+    status = "✅ норма выполнена" if week >= norm else f"осталось {norm - week}" + (f" ({hint})" if hint else "")
     lines.append(f"\nЗа неделю {week_label(start, end)}: {week} из {norm} — {status}")
     if s.get("undone"):
         lines.append("\n❌ " + s["undone"])
@@ -1586,6 +1602,9 @@ def handle_callback(cq):
         return
     if data.startswith("ut:"):
         uts_callback(cq)
+        return
+    if data.startswith("dz:"):
+        dz_callback(cq)
         return
     msg = cq.get("message") or {}
     chat_id = (msg.get("chat") or {}).get("id")
@@ -1749,7 +1768,10 @@ def duels_json():
                 for p in profiles.values() if p.get("username") and (p.get("car") or p.get("about"))}
         return {"week": week_label(start, end), "prev_week": week_label(pstart, pend), "norm": norm,
                 "pilots": pilots, "profiles": prof, "tracks": tracks_json(), "awards": awards,
-                "rivalries": rivalries(club, names) if club else [], "designers": liveries_json(), "uts": uts_json()}
+                "rivalries": rivalries(club, names) if club else [], "designers": liveries_json(), "uts": uts_json(),
+                "elo": elo_json(club, names) if club else [], "ach": ach_json(club) if club else {},
+                "ach_info": {k: list(v) for k, v in ACH.items()},
+                "lfg": [uts_name(int(k)) for k in settings.get(club, {}).get("dz", {}).get("lfg", {})] if club else []}
 
 
 def tracks_json():
@@ -1990,7 +2012,8 @@ def friday_reminder(chat_id, now):
         return
     left = (end - now.date()).days + 1
     post_to_reports(chat_id, f"⏰ До конца недели {week_label(start, end)} осталось {left} дн. Норма — {norm} дуэлей.\n"
-                             "Пока меньше половины:\n" + "\n".join(f"{mention(p)} — {n}/{norm}" for n, p in behind)
+                             "Пока меньше половины:\n" + "\n".join(f"{mention(p)} — {n}/{norm} ({pace(norm - n, left)})"
+                                                                   for n, p in behind)
                     + "\n\nСкрины «История заездов» кидайте сюда.")
 
 
@@ -2002,8 +2025,9 @@ def thursday_nudge(chat_id, now):
     for n, p in norm_rows(chat_id, start, end):
         if p["uid"] and n < norm:
             text = (f"🏁 {p['name']}, на этой неделе у тебя {n} из {norm} дуэлей — осталось {norm - n}.\n"
-                    f"До конца недели {left_days} дн. (до воскресенья включительно).\n"
-                    "Скрины «История заездов» кидай в тему отчётов клуба.")
+                    f"До конца недели {left_days} дн. (до воскресенья включительно) — {pace(norm - n, left_days)}.\n"
+                    "Скрины «История заездов» кидай в тему отчётов клуба.\n"
+                    "Не с кем катать? Напиши в чате «ищу дуэль» — бот найдёт соперника.")
             sent += bool(api("sendMessage", {"chat_id": p["uid"], "text": text}).get("ok"))
     print(f"Напоминание о норме в ЛС: доставлено {sent}")
 
@@ -3602,6 +3626,365 @@ def uts_api(init, tid, act):
     return {"ok": True, "text": res}
 
 
+# ---------- «Ищу дуэль» и вызовы на дуэль ----------
+# Всё публикуется в теме отчётов (туда же потом кидают скрин). Хранится в settings[клуб]["dz"].
+LFG_MIN = 30     # объявление «ищу дуэль» висит столько минут
+CALL_MIN = 120   # вызов ждёт ответа столько минут
+CALL_MAX = 3     # сколько вызовов без ответа может висеть у одного пилота
+
+
+def duel_board():
+    b = settings.setdefault(club_chat(), {}).setdefault("dz", {})
+    b.setdefault("lfg", {})
+    b.setdefault("calls", {})
+    return b
+
+
+def dz_edit(mid, text):
+    if mid:
+        api("editMessageText", {"chat_id": club_chat(), "message_id": mid, "text": text,
+                                "reply_markup": {"inline_keyboard": []}})
+
+
+def dz_pair(a, b):
+    uts_post(f"⚔️ Пара: {uts_tag(a)} vs {uts_tag(b)} — катайте! Скрин «История заездов» потом сюда.")
+    uts_dm([a], f"⚔️ {uts_name(b)} готов(а) катать с тобой дуэли! Скрин потом — в тему отчётов клуба.")
+    uts_dm([b], f"⚔️ {uts_name(a)} готов(а) катать с тобой дуэли! Скрин потом — в тему отчётов клуба.")
+
+
+def lfg_start(user):
+    # Возвращает (получилось ли, текст для пилота)
+    uid = user["id"]
+    if not club_chat():
+        return False, "Бот ещё не знает тему отчётов клуба."
+    if not can_have_profile(user):
+        return False, "Искать дуэль через бота могут только пилоты из таблицы клуба."
+    remember(club_chat(), user)
+    b = duel_board()
+    if str(uid) in b["lfg"]:
+        return False, "Ты уже ищешь дуэль — объявление висит в теме отчётов."
+    other = next((k for k in b["lfg"] if k != str(uid)), None)
+    if other:  # кто-то уже ищет — сразу пара
+        o = b["lfg"].pop(other)
+        dz_edit(o.get("msg"), f"✅ {uts_name(int(other))} нашёл(ла) соперника: {uts_name(uid)}.")
+        dz_pair(int(other), uid)
+        return True, f"⚔️ Соперник нашёлся сразу: {uts_name(int(other))}! Катайте."
+    mid = uts_post(f"🔎 {uts_tag(uid)} ищет дуэль прямо сейчас. Кто готов — жми кнопку.\n"
+                   f"(объявление висит {LFG_MIN} мин)",
+                   {"inline_keyboard": [[{"text": "⚔️ Я готов(а)", "callback_data": f"dz:go:{uid}"}],
+                                        [{"text": "✖️ Уже не ищу", "callback_data": f"dz:x:{uid}"}]]})
+    b["lfg"][str(uid)] = {"t": time.time(), "msg": mid}
+    return True, (f"🔎 Объявил в теме отчётов, что ты ищешь дуэль. Кто откликнется — бот напишет. "
+                  f"Объявление висит {LFG_MIN} мин.")
+
+
+def lfg_join(user, uid):
+    b = duel_board()
+    o = b["lfg"].get(str(uid))
+    if not o:
+        return "Этот пилот уже нашёл соперника или перестал искать."
+    if user["id"] == uid:
+        return "Это твоё объявление 🙂 Отменить — кнопкой «Уже не ищу»."
+    if not can_have_profile(user):
+        return "Дуэли в зачёт катают только пилоты из таблицы клуба."
+    remember(club_chat(), user)
+    b["lfg"].pop(str(uid))
+    mine = b["lfg"].pop(str(user["id"]), None)  # если и сам искал — своё объявление тоже закрываем
+    if mine:
+        dz_edit(mine.get("msg"), f"✅ {uts_name(user['id'])} нашёл(ла) соперника: {uts_name(uid)}.")
+    dz_edit(o.get("msg"), f"✅ {uts_name(uid)} нашёл(ла) соперника: {uts_name(user['id'])}.")
+    dz_pair(uid, user["id"])
+    return "⚔️ Договорились! Катайте, скрин потом — в тему отчётов."
+
+
+def lfg_stop(user, uid):
+    b = duel_board()
+    if user["id"] != uid:
+        return "Снять объявление может только тот, кто его дал."
+    o = b["lfg"].pop(str(uid), None)
+    if o:
+        dz_edit(o.get("msg"), f"✖️ {uts_name(uid)} уже не ищет дуэль.")
+    return "Объявление снято."
+
+
+def call_start(user, target):
+    uid = user["id"]
+    if not club_chat():
+        return False, "Бот ещё не знает тему отчётов клуба."
+    if not can_have_profile(user):
+        return False, "Вызывать на дуэль могут только пилоты из таблицы клуба."
+    if not target or not can_have_profile(target):
+        return False, "Этого пилота нет в таблице клуба (или бот ещё не видел его в чате)."
+    if target["id"] == uid:
+        return False, "Себя вызвать не получится 🙂"
+    remember(club_chat(), user)
+    b = duel_board()
+    mine = [c for c in b["calls"].values() if c["a"] == uid]
+    if any(c["b"] == target["id"] for c in mine):
+        return False, f"Ты уже вызвал(а) {uts_name(target['id'])} — ждём ответа."
+    if len(mine) >= CALL_MAX:
+        return False, f"У тебя уже {CALL_MAX} вызова без ответа — подожди, пока ответят."
+    cid = str(int(time.time() * 1000) % 10 ** 10)
+    while cid in b["calls"]:
+        cid = str(int(cid) + 1)
+    kb = {"inline_keyboard": [[{"text": "✅ Принять", "callback_data": f"dz:ok:{cid}"},
+                               {"text": "⏳ Не сейчас", "callback_data": f"dz:no:{cid}"}]]}
+    mid = uts_post(f"⚔️ {uts_tag(uid)} вызывает {uts_tag(target['id'])} на дуэль!\n"
+                   f"Ответить может только {uts_name(target['id'])} (вызов действует {CALL_MIN // 60} ч).", kb)
+    b["calls"][cid] = {"a": uid, "b": target["id"], "t": time.time(), "msg": mid}
+    uts_dm([target["id"]], f"⚔️ {uts_name(uid)} вызывает тебя на дуэль!", kb)
+    return True, f"⚔️ Вызов отправлен: {uts_name(target['id'])} получит его в чате и в ЛС."
+
+
+def call_answer(cq, cid, ok):
+    b = duel_board()
+    c = b["calls"].get(cid)
+    if not c:
+        return "Этот вызов уже неактуален."
+    if cq["from"]["id"] != c["b"]:
+        return f"Ответить на вызов может только {uts_name(c['b'])}."
+    b["calls"].pop(cid)
+    a, t = c["a"], c["b"]
+    text = (f"✅ {uts_name(t)} принял(а) вызов {uts_name(a)} — катайте! Скрин потом сюда." if ok
+            else f"⏳ {uts_name(t)} сейчас не может принять вызов {uts_name(a)}.")
+    dz_edit(c.get("msg"), text)
+    msg = cq.get("message") or {}
+    if (msg.get("chat") or {}).get("id", 0) > 0:  # нажали в ЛС — правим и это сообщение
+        api("editMessageText", {"chat_id": msg["chat"]["id"], "message_id": msg["message_id"], "text": text,
+                                "reply_markup": {"inline_keyboard": []}})
+    uts_dm([a], f"✅ {uts_name(t)} принял(а) твой вызов — катайте!" if ok
+           else f"⏳ {uts_name(t)} сейчас не может принять твой вызов. Попробуй позже.")
+    return "✅ Принято! Катайте." if ok else "Ок, ответил(а) «не сейчас»."
+
+
+def dz_callback(cq):
+    _, act, arg = (cq["data"].split(":") + ["", ""])[:3]
+    if act == "go":
+        res = lfg_join(cq["from"], int(arg))
+    elif act == "x":
+        res = lfg_stop(cq["from"], int(arg))
+    elif act in ("ok", "no"):
+        res = call_answer(cq, arg, act == "ok")
+    else:
+        res = ""
+    api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": res, "show_alert": bool(res)})
+
+
+def dz_tick(now):
+    b = settings.get(club_chat(), {}).get("dz") if club_chat() else None
+    if not b:
+        return False
+    changed = False
+    for k, v in list(b.get("lfg", {}).items()):
+        if now - v["t"] > LFG_MIN * 60:
+            b["lfg"].pop(k)
+            dz_edit(v.get("msg"), f"⌛ {uts_name(int(k))} искал(а) дуэль, но никто не откликнулся.")
+            changed = True
+    for k, c in list(b.get("calls", {}).items()):
+        if now - c["t"] > CALL_MIN * 60:
+            b["calls"].pop(k)
+            dz_edit(c.get("msg"), f"⌛ Вызов {uts_name(c['a'])} → {uts_name(c['b'])} остался без ответа.")
+            changed = True
+    return changed
+
+
+def dz_command(msg, cmd, args):
+    # /lfg или «ищу дуэль» — найти соперника; /call @ник (или ответом) — вызвать на дуэль. Работает и в ЛС бота.
+    is_group = msg["chat"]["type"] != "private"
+    if cmd == "lfg":
+        ok, text = lfg_start(msg["from"])
+        if not is_group or not ok:
+            reply(msg, text)
+        return
+    target = (msg.get("reply_to_message") or {}).get("from")
+    if not target and args:
+        target = club_user_by_name(args[0])
+    if not target:
+        reply(msg, "Кого вызываем? Напиши /call @ник или ответь командой на сообщение пилота.")
+        return
+    ok, text = call_start(msg["from"], target)
+    if not is_group or not ok:
+        reply(msg, text)
+
+
+def duel_api(init, act, to=""):
+    user = webapp_user(init)
+    if not user:
+        return {"ok": False, "error": "Это работает, только когда приложение открыто в Телеграме"}
+    if not user.get("username"):
+        user["username"] = members.get(club_chat(), {}).get(user.get("id"), {}).get("username", "")
+    if act == "lfg":
+        ok, text = lfg_start(user)
+    elif act == "call":
+        ok, text = call_start(user, club_user_by_name(to or ""))
+    else:
+        return {"ok": False, "error": "неизвестное действие"}
+    return {"ok": True, "text": text, "done": ok}
+
+
+# ---------- Рейтинг Эло ----------
+# Считается по дуэлям, которые идут в норму, по порядку дат. Дуэль между двумя пилотами клуба записана у обоих —
+# считаем её один раз. Хранится только то, что бот помнит (10 недель).
+ELO_START, ELO_K = 1000, 24
+
+
+def elo_games(chat_id, names, until=None):
+    games = {}  # (дата, пилот A, пилот B, счёт A, счёт B) → [результат A, сколько раз]
+    disp = {}
+    for uid in club_uids(chat_id):
+        me = pilot_name(chat_id, uid).strip()
+        if not me or me.lower() not in names:
+            continue
+        disp[me.lower()] = me
+        side = {}
+        for d in counted(chat_id, uid, names):
+            if until and d["d"] >= until:
+                continue
+            sc = score_pair(d["s"]) or (0.0, 0.0)
+            opp = d["o"].strip()
+            disp.setdefault(opp.lower(), opp)
+            res = {"win": 1.0, "loss": 0.0}.get(d["r"], 0.5)
+            if me.lower() < opp.lower():
+                key = (d["d"], me.lower(), opp.lower(), sc[0], sc[1])
+            else:
+                key, res = (d["d"], opp.lower(), me.lower(), sc[1], sc[0]), 1 - res
+            side[key] = side.get(key, 0) + 1
+            games.setdefault(key, [res, 0])
+        for key, n in side.items():
+            games[key][1] = max(games[key][1], n)  # у второго пилота та же дуэль — не удваиваем
+    return games, disp
+
+
+def elo_table(chat_id, names=None, until=None):
+    names = club_names() if names is None else names
+    games, disp = elo_games(chat_id, names, until)
+    rating, played = {}, {}
+    for key in sorted(games):
+        res, n = games[key]
+        a, b = key[1], key[2]
+        for _ in range(n):
+            ra, rb = rating.get(a, ELO_START), rating.get(b, ELO_START)
+            delta = ELO_K * (res - 1 / (1 + 10 ** ((rb - ra) / 400)))
+            rating[a], rating[b] = ra + delta, rb - delta
+            played[a], played[b] = played.get(a, 0) + 1, played.get(b, 0) + 1
+    return {k: [disp.get(k, k), r, played[k]] for k, r in rating.items()}
+
+
+def elo_json(chat_id, names=None):
+    names = club_names() if names is None else names
+    now = elo_table(chat_id, names)
+    before = elo_table(chat_id, names, until=week_bounds()[0].isoformat())
+    rows = [[v[0], round(v[1]), v[2], round(v[1] - (before[k][1] if k in before else ELO_START))] for k, v in now.items()]
+    return sorted(rows, key=lambda r: (-r[1], r[0].lower()))  # [ник, рейтинг, дуэлей, за неделю]
+
+
+# ---------- Ачивки ----------
+# Однажды полученная ачивка остаётся навсегда (settings[клуб]["ach"]: uid → {код: дата}).
+ACH = {
+    "first": ("🏁", "Первая дуэль", "первая дуэль в зачёт"),
+    "d50": ("🔥", "50 дуэлей", "50 дуэлей в зачёт за 10 недель"),
+    "d100": ("💯", "100 дуэлей", "100 дуэлей в зачёт за 10 недель"),
+    "w5": ("⚡", "5 побед подряд", "5 побед подряд в дуэлях"),
+    "w10": ("🌪", "10 побед подряд", "10 побед подряд в дуэлях"),
+    "s195": ("🚀", "195+ баллов", "195 баллов и больше в дуэли"),
+    "s200": ("👑", "200 баллов", "идеальные 200 баллов в дуэли"),
+    "norm": ("✅", "Норма", "выполнил(а) недельную норму"),
+    "norm3": ("📅", "3 нормы подряд", "норма 3 недели подряд"),
+    "rival": ("🤝", "Заклятый соперник", "10 дуэлей с одним и тем же пилотом"),
+    "king": ("🗺", "Король карты", "больше всех побед на одной из карт"),
+    "uts": ("🏆", "Чемпион мини-УТС", "выиграл(а) мини-УТС"),
+    "elo1": ("🥇", "Первый в рейтинге", "первое место в рейтинге Эло"),
+}
+
+
+def ach_earned(chat_id, uid, names, ctx):
+    lst = counted(chat_id, uid, names)
+    got = set()
+    if lst:
+        got.add("first")
+    if len(lst) >= 50:
+        got.add("d50")
+    if len(lst) >= 100:
+        got.add("d100")
+    run = best = 0
+    for d in lst:
+        run = run + 1 if d["r"] == "win" else 0
+        best = max(best, run)
+    if best >= 5:
+        got.add("w5")
+    if best >= 10:
+        got.add("w10")
+    top = max((own_score(d["s"]) for d in lst), default=0)
+    if top >= 195:
+        got.add("s195")
+    if top >= 200:
+        got.add("s200")
+    norm = get_norm(chat_id)
+    if lst and any(duels_in(chat_id, uid, *week_bounds(back=i)) >= norm for i in range(DUEL_KEEP_DAYS // 7 + 1)):
+        got.add("norm")
+    if norm_streak(chat_id, uid, norm) >= 3:
+        got.add("norm3")
+    opp = {}
+    for d in lst:
+        opp[d["o"].strip().lower()] = opp.get(d["o"].strip().lower(), 0) + 1
+    if any(n >= 10 for n in opp.values()):
+        got.add("rival")
+    me = pilot_name(chat_id, uid).strip().lower()
+    if me in ctx["kings"]:
+        got.add("king")
+    if uid in ctx["uts"]:
+        got.add("uts")
+    if me and me == ctx["elo1"]:
+        got.add("elo1")
+    return got
+
+
+def ach_update(chat_id):
+    # Проверяет всех пилотов и объявляет новые ачивки в теме отчётов. Первый запуск — молча (без спама старыми).
+    conf = settings.setdefault(chat_id, {})
+    first_run = "ach" not in conf
+    ach = conf.setdefault("ach", {})
+    names = club_names()
+    if not names:  # таблица пилотов не прочиталась — не раздаём ачивки за дуэли с кем попало
+        return []
+    elo = elo_table(chat_id, names)
+    ranked = [k for k, v in sorted(elo.items(), key=lambda kv: -kv[1][1]) if v[2] >= 10]  # лидер — от 10 дуэлей
+    ctx = {"kings": {v[0].strip().lower() for v in map_kings(chat_id, names).values()},
+           "uts": {h["places"][0] for h in conf.get("uts_hist", []) if h.get("places")},
+           "elo1": ranked[0] if ranked else ""}
+    new = []
+    for uid in club_uids(chat_id):
+        if not pilot_name(chat_id, uid):
+            continue
+        have = ach.setdefault(str(uid), {})
+        for code in sorted(ach_earned(chat_id, uid, names, ctx), key=list(ACH).index):
+            if code not in have:
+                have[code] = msk_today().isoformat()
+                new.append((uid, code))
+    if new and not first_run:
+        by = {}
+        for uid, code in new:
+            by.setdefault(uid, []).append(code)
+        lines = [f"{mention_uid(chat_id, uid)} — " + ", ".join(f"{ACH[c][0]} {ACH[c][1]}" for c in codes)
+                 for uid, codes in by.items()]
+        post_to_reports(chat_id, "🏅 Новые ачивки!\n" + "\n".join(lines) + "\n\nВсе значки — в профиле пилота в приложении клуба.")
+    return new
+
+
+def mention_uid(chat_id, uid):
+    u = members.get(chat_id, {}).get(uid, {})
+    return f"@{u['username']}" if u.get("username") else pilot_name(chat_id, uid)
+
+
+def ach_json(chat_id):
+    out = {}
+    for uid, have in settings.get(chat_id, {}).get("ach", {}).items():
+        who = pilot_name(chat_id, int(uid)).strip().lower()
+        if who:
+            out[who] = sorted([[c, d] for c, d in have.items() if c in ACH], key=lambda x: list(ACH).index(x[0]))
+    return out
+
+
 DM_TEST_TEXT = ("✅ Тест: бот может писать вам в ЛС.\n"
                 "Сюда по понедельникам будет приходить список не выполнивших норму с кнопками варна, "
                 "а также сигналы о возможной накрутке дуэлей.")
@@ -3673,6 +4056,10 @@ def scheduler_tick(now):
                 changed = True
         if uts_tick(time.time()):  # турниры: напоминания, чек-ин, автоотмена, техпоражения
             changed = True
+        if dz_tick(time.time()):  # «ищу дуэль» и вызовы без ответа
+            changed = True
+        if club_chat() and ach_update(club_chat()):  # новые ачивки
+            changed = True
         if changed:
             save_state()
         if time.time() - _auto["backup"] > 6 * 3600:
@@ -3742,6 +4129,8 @@ HELP_TEXT = """📖 Команды бота
 /liveryhere — написать в нужной теме: туда бот будет публиковать новые ливреи и «Ливрею недели»
 /order — в ЛС бота: заказать ливрею у ливрейщика клуба
 /uts — мини-УТС: создать турнир (топ-4…32, с лузер-сеткой или на вылет), запись — кнопкой «Участвую»
+/lfg или «ищу дуэль» — бот объявит, что ты ищешь соперника, и сведёт пару
+/call @ник (или «вызов» ответом) — вызвать пилота на дуэль: он примет или ответит «не сейчас»
 
 🤖 Сам бот: в пятницу 18:00 напоминает тем, у кого меньше половины нормы, в понедельник 10:00 подводит
 итоги недели. Админам в ЛС приходит список не выполнивших норму с кнопками варна и сигналы о возможной
@@ -3856,6 +4245,14 @@ def handle(msg):
     if cmd == "uts" or (cmd == "start" and not is_group and args[:1] == ["uts"]):
         uts_cmd(msg)
         return
+    if cmd == "lfg" or lower.strip(" !.") in ("ищу дуэль", "ищу соперника") or (cmd == "start" and not is_group and args[:1] == ["lfg"]):
+        dz_command(msg, "lfg", args)
+        return
+    words = lower.split()
+    if cmd == "call" or (is_group and words[:1] == ["вызов"] and ((len(words) == 1 and msg.get("reply_to_message"))
+                                                                  or (len(words) == 2 and words[1].startswith("@")))):
+        dz_command(msg, "call", words[1:] if not cmd else args)
+        return
     if cmd == "order" or (cmd == "start" and not is_group and args and args[0].startswith("order_")):
         if is_group:
             reply(msg, f"Ливрею заказывают в личке бота: напиши @{BOT_USERNAME} команду /order.")
@@ -3914,14 +4311,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
-        if self.path.startswith(("/api/like", "/api/uts")):
+        if self.path.startswith(("/api/like", "/api/uts", "/api/duel")):
             # Лайк ливреи или запись на турнир из мини-приложения. Тело — JSON простым текстом (без лишнего CORS-запроса)
             with LOCK:
                 try:
                     req = json.loads(body or b"{}")
                     load_state()
-                    res = (uts_api(req.get("init"), req.get("id"), req.get("act")) if self.path.startswith("/api/uts")
-                           else like_livery(req.get("init"), req.get("id")))
+                    if self.path.startswith("/api/uts"):
+                        res = uts_api(req.get("init"), req.get("id"), req.get("act"))
+                    elif self.path.startswith("/api/duel"):
+                        res = duel_api(req.get("init"), req.get("act"), req.get("to"))
+                    else:
+                        res = like_livery(req.get("init"), req.get("id"))
                     if res.get("ok"):
                         save_state()
                 except Exception as e:
@@ -3999,7 +4400,8 @@ PUBLIC_MENU = [
     ("team", "Состав по должностям"), ("staff", "Модераторы и админы"), ("rules", "Правила чата"),
     ("warns", "Предупреждения"), ("report", "Позвать модерацию (ответом)"),
     ("norm", "Норма дуэлей за неделю"), ("normall", "Норма дуэлей у всех"),
-    ("recheck", "Перечитать скрин (ответом)"), ("myprofile", "Мой профиль: фото машины в ливрее клуба"),
+    ("recheck", "Перечитать скрин (ответом)"), ("lfg", "Ищу дуэль: найти соперника"),
+    ("call", "Вызвать на дуэль: /call @ник"), ("myprofile", "Мой профиль: фото машины в ливрее клуба"),
     ("app", "Таблицы клуба"),
 ]
 ADMIN_MENU = PUBLIC_MENU + [
