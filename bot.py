@@ -322,6 +322,7 @@ def welcome(chat_id, user):
     if conf.get("welcome_off") or user.get("is_bot"):
         return
     text = (conf.get("welcome") or DEFAULT_WELCOME).replace("{name}", name_of(user))
+    text += f"\n\n👋 Новенький? Как тут всё устроено — открой бота: https://t.me/{BOT_USERNAME}?start=guide"
     send(chat_id, text, group=True)
 
 
@@ -2480,7 +2481,7 @@ def cmd_liveryhere(msg, args, my):
 def post_livery(chat_id, uid, it, head):
     fs = lv_photos(it)
     thread = settings.get(chat_id, {}).get("livery_thread")
-    caption = f"{head}\n\n{livery_caption(uid, it)}\n\nВсе работы — в приложении клуба: «Пилоты» → «🎨 Мастерская ливрей»."
+    caption = f"{head}\n\n{livery_caption(uid, it)}\n\nВсе работы — в приложении клуба: «Главная» → «🎨 Мастерская ливрей»."
     if len(fs) > 1:
         payload = {"chat_id": chat_id, "media": [dict({"type": "photo", "media": f}, **({"caption": caption} if i == 0 else {}))
                                                  for i, f in enumerate(fs)]}
@@ -3168,7 +3169,7 @@ def uts_finish(t):
     t["places"] = [p for p in places if p]
     medals = ["🥇", "🥈", "🥉"]
     uts_post(f"🏆 {t['title']} завершён!\n\n" + "\n".join(f"{medals[i]} {uts_name(p)}" for i, p in enumerate(t["places"]))
-             + "\n\nСетка — в приложении клуба: «Пилоты» → «🏁 Турниры».",
+             + "\n\nСетка — в приложении клуба: «Главная» → «🏁 Турниры».",
              {"inline_keyboard": [[{"text": "🔁 Реванш тем же составом", "callback_data": f"ut:r:{t['id']}"}]]})
     uts_pred_finish(t)
     hist = settings.setdefault(club_chat(), {}).setdefault("uts_hist", [])
@@ -3192,7 +3193,7 @@ def uts_begin(t):
         ("с лузер-сеткой" if t["de"] and len(seeds) > 2 else "на вылет")
     uts_post(f"🏁 {t['title']} стартует! Участников: {len(seeds)}, формат: {fmt}.\n"
              + "Посев: " + ", ".join(f"{i + 1}. {uts_name(u)}" for i, u in enumerate(seeds))
-             + "\nПары будут появляться здесь. Сетка — в приложении: «Пилоты» → «🏁 Турниры».")
+             + "\nПары будут появляться здесь. Сетка — в приложении: «Главная» → «🏁 Турниры».")
     if t["fmt"] == "rr":
         uts_post(f"🔄 {t['title']}: каждый катает с каждым, в любом порядке. Пары:\n"
                  + "\n".join(f"• {uts_tag(m['a']['p'])} vs {uts_tag(m['b']['p'])}" for m in t["matches"])
@@ -4413,6 +4414,8 @@ def admin_api(init, act, uid=None, group=None):
     my = get_level(chat_id, user["id"])
     if my < 2:
         return {"ok": False, "error": "Админ-панель — только для администраторов клуба", "denied": True}
+    if act == "export":
+        return export_link(chat_id, 1 if str(uid) == "1" else 0)
     if act == "undo":
         uid = int(uid)
         if user["id"] != uid and get_level(chat_id, uid) >= my:
@@ -4426,6 +4429,71 @@ def admin_api(init, act, uid=None, group=None):
         schedule_sheet_sync(chat_id)
         return {"ok": True, "text": f"Снято дуэлей: {removed}"}
     return {"ok": True, "data": admin_json(chat_id)}
+
+
+# ---------- Знакомство для новичков ----------
+ONBOARDING = [
+    "👋 Привет! Я бот клуба Khinkali Racing. Коротко, как тут всё устроено.\n\n"
+    "📸 Дуэли\nПосле дуэлей кидай скрин «История заездов» в тему отчётов клуба — я сам прочитаю дату, соперника, "
+    "счёт и трассу. Дуэль с пилотом клуба засчитывается вам обоим, второму сдавать не нужно.\n\n"
+    "🏁 Норма\nВ неделю (пн–вс) нужно {norm} дуэлей с пилотами клуба, от 100.1 балла. Свои цифры — /norm. "
+    "В четверг напомню в ЛС, если не добираешь.",
+    "⚔️ С кем катать\n• «ищу дуэль» в чате — найду соперника, кто свободен прямо сейчас\n"
+    "• /call @ник — вызвать пилота на дуэль\n• /uts — мини-турнир с сеткой, без судей\n"
+    "• /goal 30 — личная цель на неделю\n\n"
+    "🏆 За дуэли растёт рейтинг Эло, даются ачивки, а по понедельникам клуб делится на две команды.",
+    "📱 Всё это — в приложении клуба: твой профиль, рейтинги, турниры, мастерская ливрей. "
+    "Там же страница «❓ Что умеет бот».\n\nПоставь фото своей машины в ливрее клуба: /myprofile\nВсе команды: /help",
+]
+
+
+def onboarding(uid):
+    norm = get_norm(club_chat()) if club_chat() else DUEL_NORM_DEFAULT
+    for i, text in enumerate(ONBOARDING):
+        send(uid, text.replace("{norm}", str(norm)), with_button=i == len(ONBOARDING) - 1)
+    profiles.setdefault(uid, {})["onb"] = 1
+
+
+# ---------- Выгрузка дуэлей таблицей (админ-панель) ----------
+EXPORT_TTL = 300  # ссылка на файл живёт 5 минут
+_exports = {}
+
+
+def export_csv(chat_id, back=0):
+    start, end = week_bounds(back=back)
+    a, b = start.isoformat(), end.isoformat()
+    names, base = club_names(), shot_base(chat_id)
+    rows = []
+    for uid, lst in duels.get(chat_id, {}).items():
+        u = members.get(chat_id, {}).get(uid, {})
+        for d in lst:
+            if not a <= d["d"] <= b:
+                continue
+            why = why_not_counted(d, names)
+            rows.append([d["d"], pilot_name(chat_id, uid) or str(uid), "@" + u["username"] if u.get("username") else "",
+                         d["o"], RESULT_RU.get(d["r"], d["r"]), d["s"], d.get("t", ""), "нет: " + why if why else "да",
+                         "по отчёту соперника" if d.get("by") else "", base + str(d["m"]) if d.get("m") and base else ""])
+    rows.sort(key=lambda r: (r[0], r[1].lower()))
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";")  # «;» — так Excel с русскими настройками сразу раскладывает по колонкам
+    w.writerow(["Дата", "Пилот", "Телеграм", "Соперник", "Результат", "Счёт", "Трасса", "В норму", "Откуда", "Скрин"])
+    w.writerows(rows)
+    return ("\ufeff" + buf.getvalue()).encode("utf-8"), f"duels_{start:%d.%m}-{end:%d.%m}.csv", len(rows)
+
+
+def export_link(chat_id, back=0):
+    now = time.time()
+    for k in [k for k, v in _exports.items() if v[2] < now]:
+        del _exports[k]
+    data, name, n = export_csv(chat_id, back)
+    token = os.urandom(12).hex()
+    _exports[token] = (data, name, now + EXPORT_TTL)
+    return {"ok": True, "url": f"/export/{token}/{name}", "name": name, "n": n}
+
+
+def export_file(token):
+    v = _exports.get(token)
+    return (v[0], v[1]) if v and v[2] >= time.time() else (None, None)
 
 
 DM_TEST_TEXT = ("✅ Тест: бот может писать вам в ЛС.\n"
@@ -4582,6 +4650,7 @@ HELP_TEXT = """📖 Команды бота
 /call @ник (или «вызов» ответом) — вызвать пилота на дуэль: он примет или ответит «не сейчас»
 /goal 30 — личная цель дуэлей на неделю (/goal off — снять)
 /teams (или «команды») — счёт командной недели
+/guide — в ЛС бота: коротко, как всё устроено (для новичков)
 
 🤖 Сам бот: в пятницу 18:00 напоминает тем, у кого меньше половины нормы, в понедельник 10:00 подводит
 итоги недели. Админам в ЛС приходит список не выполнивших норму с кнопками варна и сигналы о возможной
@@ -4681,6 +4750,13 @@ def handle(msg):
     lower = text.lower()
     cmd, args, is_word = parse_command(text)
 
+    if not is_group and (cmd == "guide" or (cmd == "start" and (args[:1] == ["guide"]
+                                                                 or (not args and not profiles.get(chat_id, {}).get("onb"))))):
+        onboarding(chat_id)
+        return
+    if cmd == "myid" and not is_group:
+        reply(msg, f"Твой Telegram ID: {msg['from']['id']}")
+        return
     if cmd == "myprofile" or (cmd == "start" and not is_group and args[:1] == ["profile"]):
         myprofile(msg)
         return
@@ -4813,6 +4889,17 @@ class Handler(BaseHTTPRequestHandler):
             save_state()
 
     def do_GET(self):
+        if self.path.startswith("/export/"):
+            # Выгрузка дуэлей из админ-панели: одноразовая ссылка, живёт 5 минут
+            data, name = export_file(self.path.split("/")[2])
+            self.send_response(200 if data else 404)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            if data:
+                self.send_header("Content-Type", "text/csv; charset=utf-8")
+                self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+            self.end_headers()
+            self.wfile.write(data or "Ссылка устарела — нажми «Скачать» в админ-панели ещё раз".encode())
+            return
         if self.path.startswith(("/photo/", "/maplogo/", "/livery/")):
             # Фото машины пилота (/photo/<@ник>), логотип карты (/maplogo/<трасса>) или ливрея (/livery/<id>) для приложения
             kind = self.path.split("/", 2)[1]
