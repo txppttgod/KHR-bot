@@ -1,0 +1,62 @@
+# Сторож бота: раз в ~5 минут проверяет, что бот на Render отвечает.
+# Если бот упал — пишет в Телеграм, когда поднялся — тоже. Сообщение только при смене состояния, без спама.
+# Нужны секреты репозитория (Settings → Secrets and variables → Actions):
+#   BOT_TOKEN  — токен бота (тот же, что на Render)
+#   ALERT_CHAT — кому писать: твой Telegram ID (узнать — /myid в ЛС бота)
+name: Bot monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Previous state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: monitor-${{ github.run_id }}
+          restore-keys: monitor-
+
+      - name: Check bot
+        id: check
+        run: |
+          now=down
+          for i in 1 2 3; do
+            if curl -fsS -m 60 https://khr-bot.onrender.com/ > /dev/null; then now=up; break; fi
+            sleep 20
+          done
+          prev=$(cat state/status 2>/dev/null || echo up)
+          echo "Бот: $now (в прошлый раз: $prev)"
+          mkdir -p state
+          echo "$now" > state/status
+          echo "now=$now" >> "$GITHUB_OUTPUT"
+          echo "prev=$prev" >> "$GITHUB_OUTPUT"
+
+      - name: Save state
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: monitor-${{ github.run_id }}
+
+      - name: Alert
+        if: steps.check.outputs.now != steps.check.outputs.prev
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ALERT_CHAT: ${{ secrets.ALERT_CHAT }}
+          NOW: ${{ steps.check.outputs.now }}
+        run: |
+          if [ -z "$BOT_TOKEN" ] || [ -z "$ALERT_CHAT" ]; then
+            echo "Секреты BOT_TOKEN и ALERT_CHAT не заданы — сообщение не отправлено"
+            exit 0
+          fi
+          if [ "$NOW" = down ]; then
+            text="🚨 Бот KHR не отвечает (https://khr-bot.onrender.com). Проверь Render: https://dashboard.render.com"
+          else
+            text="✅ Бот KHR снова отвечает."
+          fi
+          curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${ALERT_CHAT}" --data-urlencode "text=${text}" > /dev/null
