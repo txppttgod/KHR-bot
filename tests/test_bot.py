@@ -901,6 +901,30 @@ finally:
     time.time = _real_time
 bot.save_state()
 check("order ids unique within one millisecond", len(set(ids)) == 2, [("sendMessage", {"text": str(ids)})])
+# ---------- знакомство для новичков, /myid, выгрузка дуэлей ----------
+names[7] = ("Новичок", "newbie")
+c = dm(7, text="/start")
+dms = [p for m, p in c if m == "sendMessage" and p.get("chat_id") == 7]
+check("onboarding on first /start", len(dms) == 3 and "История заездов" in dms[0]["text"] and "ищу дуэль" in dms[1]["text"]
+      and dms[2].get("reply_markup") and not dms[0].get("reply_markup"), [("sendMessage", p) for p in dms])
+c = dm(7, text="/start"); check("plain /start later is short", sum(1 for m, p in c if m == "sendMessage") == 1 and "История заездов" not in texts(c), [])
+c = dm(7, text="/guide"); check("guide any time", sum(1 for m, p in c if m == "sendMessage") == 3, [])
+send(OWNER, "/welcome on")
+c = dm(7, text="/myid"); check("myid", "Твой Telegram ID: 7" in texts(c), [])
+mid[0] += 1
+calls.clear(); bot.load_state()
+bot.handle({"message_id": mid[0], "chat": {"id": CHAT, "type": "supergroup"}, "from": u(7), "new_chat_members": [u(7)]}); bot.save_state()
+check("welcome links to guide", any("start=guide" in (p or {}).get("text", "") for m, p in calls), calls)
+check("export only for admins", not bot.admin_api(init_for(USER), "export")["ok"], [])
+r = shot(USER, OWNER, [True, False])
+bot.load_state(); res = bot.admin_api(init_for(OWNER), "export")
+data, fname = bot.export_file(res["url"].split("/")[2]) if res.get("ok") else (None, None)
+txt = data.decode("utf-8-sig") if data else ""
+check("export csv", res["ok"] and res["n"] >= 2 and fname.startswith("duels_") and txt.startswith("Дата;Пилот;")
+      and "Ivan;@ivan;Ernest;Победа" in txt and "https://t.me/c/1/83379/" in txt, [("sendMessage", {"text": txt[:300]})])
+res2 = bot.admin_api(init_for(OWNER), "export", 1)
+check("export last week", res2["ok"] and res2["name"] != res["name"], [])
+check("bad export token", bot.export_file("nope") == (None, None), [])
 print("\n".join(checks))
 failed = sum(c.startswith("FAIL") for c in checks)
 print("FAILED:", failed, "of", len(checks))
