@@ -12,6 +12,7 @@ import requests
 import queue
 import hmac
 import hashlib
+import zlib
 import random
 from urllib.parse import unquote, parse_qsl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -3111,6 +3112,7 @@ def uts_result(t, m, winner, note=""):
     score = f" ({m['sa']}:{m['sb']})" if m["bo"] > 1 else ""
     uts_post(f"✅ {t['title']} · {m['name']}: побеждает {uts_name(winner)}{score}{note}")
     uts_advance(t)
+    uts_widgets_refresh(t)
 
 
 def uts_game(t, m, winner, a, b):
@@ -3200,6 +3202,8 @@ def uts_begin(t):
                  + f"\n\nПосле каждой дуэли кидайте скрин сюда. На всё — {UTS_RR_MAX_MIN // 60} ч.")
     uts_pred_open(t)
     uts_advance(t)
+    if t["state"] == "run":
+        uts_widgets_send(t)
 
 
 def uts_cancel(t, why):
@@ -3794,7 +3798,17 @@ def call_start(user, target):
                    + elo_odds_text(club_chat(), uid, target["id"]) + "\n"
                    f"Ответить может только {uts_name(target['id'])} (вызов действует {CALL_MIN // 60} ч).", kb)
     b["calls"][cid] = {"a": uid, "b": target["id"], "t": time.time(), "msg": mid}
-    uts_dm([target["id"]], f"⚔️ {uts_name(uid)} вызывает тебя на дуэль!", kb)
+    elo = elo_table(club_chat())
+    an, bn = pilot_name(club_chat(), uid).strip(), pilot_name(club_chat(), target["id"]).strip()
+    ra, rb = elo.get(an.lower(), [an, ELO_START, 0])[1], elo.get(bn.lower(), [bn, ELO_START, 0])[1]
+    st = pilot_stats(counted(club_chat(), target["id"], club_names())).get("vs", {}).get(an.lower())
+    wd = {"a": an or uts_name(uid), "ra": round(ra), "rb": round(rb), "p": round(elo_p(ra, rb) * 100),
+          "hh": f"{st[1]}:{st[2]}" if st else ""}
+    wmid = send_widget(target["id"], WIDGET_CALL, wd, f"⚔️ {uts_name(uid)} вызывает тебя на дуэль!", height=220, markup=kb)
+    if wmid is None:
+        uts_dm([target["id"]], f"⚔️ {uts_name(uid)} вызывает тебя на дуэль!", kb)
+    elif wmid:
+        b["calls"][cid].update(wm=wmid, wd=wd)
     return True, f"⚔️ Вызов отправлен: {uts_name(target['id'])} получит его в чате и в ЛС."
 
 
@@ -3811,7 +3825,10 @@ def call_answer(cq, cid, ok):
             else f"⏳ {uts_name(t)} сейчас не может принять вызов {uts_name(a)}.")
     dz_edit(c.get("msg"), text)
     msg = cq.get("message") or {}
-    if (msg.get("chat") or {}).get("id", 0) > 0:  # нажали в ЛС — правим и это сообщение
+    if c.get("wm"):  # вызов пришёл виджетом — меняем на нём статус и подпись
+        widget_data(t, c["wm"], dict(c["wd"], st="ok" if ok else "no"))
+        api("editMessageCaption", {"chat_id": t, "message_id": c["wm"], "caption": text, "reply_markup": {"inline_keyboard": []}})
+    elif (msg.get("chat") or {}).get("id", 0) > 0:  # нажали в ЛС — правим и это сообщение
         api("editMessageText", {"chat_id": msg["chat"]["id"], "message_id": msg["message_id"], "text": text,
                                 "reply_markup": {"inline_keyboard": []}})
     uts_dm([a], f"✅ {uts_name(t)} принял(а) твой вызов — катайте!" if ok
@@ -3846,6 +3863,9 @@ def dz_tick(now):
         if now - c["t"] > CALL_MIN * 60:
             b["calls"].pop(k)
             dz_edit(c.get("msg"), f"⌛ Вызов {uts_name(c['a'])} → {uts_name(c['b'])} остался без ответа.")
+            if c.get("wm"):
+                widget_data(c["b"], c["wm"], dict(c["wd"], st="old"))
+                api("editMessageReplyMarkup", {"chat_id": c["b"], "message_id": c["wm"], "reply_markup": {"inline_keyboard": []}})
             changed = True
     return changed
 
@@ -4496,6 +4516,172 @@ def export_file(token):
     return (v[0], v[1]) if v and v[2] >= time.time() else (None, None)
 
 
+# ---------- Виджеты в личке бота (Bot API 10.4: sendWidget) ----------
+# Виджет — HTML прямо в сообщении. Сети внутри нет: данные кладём в chat_data (до 1 КБ),
+# обновляем через editMessageWidgetData. Работает только в личке с ботом; если Телеграм
+# виджет не принял (старое приложение, ошибка), отправляем обычный текст.
+WIDGET_JS = (
+    "var W=window.TelegramWidget||{},T=W.themeParams||{},dk=W.colorScheme!=='light';"
+    "var C={b:T.bg_color||(dk?'#17171c':'#fff'),t:T.text_color||(dk?'#f2f2f2':'#111'),h:T.hint_color||'#8a8a93',"
+    "s:T.secondary_bg_color||(dk?'#25252c':'#f0f0f3'),a:'#e8452c',g:'#2fbf71'};"
+    "function E(x){return String(x==null?'':x).replace(/[&<>\"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]})}"
+    "function D(){try{return JSON.parse(W.chatData||'{}')}catch(e){return{}}}"
+    "function go(){document.getElementById('r').innerHTML=view(D())}"
+    "go();if(W.onEvent)W.onEvent('chatDataChanged',go);if(W.ready)W.ready();"
+)
+
+WIDGET_CARD = (
+    "<div id='r'></div><script>function view(d){"
+    "var p=Math.min(100,Math.round((d.w||0)/(d.nr||20)*100)),h=d.h||[],pts=[],lo=1e9,hi=-1e9,i,s='';"
+    "var f=null,l=null;for(i=0;i<h.length;i++)if(h[i]!=null){lo=Math.min(lo,h[i]);hi=Math.max(hi,h[i]);if(f==null)f=h[i];l=h[i]}var up=l>=f;"
+    "for(i=0;i<h.length;i++)if(h[i]!=null)pts.push(Math.round(i/9*290+5)+','+Math.round(44-(h[i]-lo)/((hi-lo)||1)*38));"
+    "s+='<div style=\"background:'+C.b+';color:'+C.t+';font:14px system-ui,sans-serif;padding:12px\">';"
+    "s+='<div style=\"color:'+C.h+';font-size:12px\">ПИЛОТ KHR · №'+E(d.num)+'</div><div style=\"font-size:20px;font-weight:700\">'+E(d.n)+'</div>';"
+    "s+='<div style=\"margin-top:8px\"><b style=\"font-size:26px\">'+(d.w||0)+'</b> <span style=\"color:'+C.h+'\">из '+(d.nr||20)+' за неделю</span></div>';"
+    "s+='<div style=\"height:6px;border-radius:3px;background:'+C.s+'\"><div style=\"height:6px;border-radius:3px;width:'+p+'%;background:'+(p>=100?C.g:C.a)+'\"></div></div>';"
+    "if(d.gl)s+='<div style=\"font-size:12px;margin-top:4px;color:'+C.h+'\">🎯 цель: '+(d.w||0)+' из '+d.gl+'</div>';"
+    "s+='<div style=\"display:flex;gap:6px;margin-top:10px\">';"
+    "[['Эло',d.e?d.e+(d.dl?(d.dl>0?' ▲':' ▼')+Math.abs(d.dl):''):'—'],['Место',d.pl?d.pl+' из '+d.of:'—'],['Победы',d.wr!=null?d.wr+'%':'—']]"
+    ".forEach(function(x){s+='<div style=\"flex:1;background:'+C.s+';border-radius:8px;padding:6px;text-align:center\"><div style=\"font-size:11px;color:'+C.h+'\">'+x[0]+'</div><b>'+x[1]+'</b></div>'});"
+    "s+='</div>';if(pts.length>1)s+='<svg viewBox=\"0 0 300 50\" width=\"100%\" height=\"50\" style=\"margin-top:8px\"><polyline fill=\"none\" stroke=\"'+(up?C.g:C.a)+'\" stroke-width=\"2.5\" points=\"'+pts.join(' ')+'\"/></svg>';"
+    "if(d.a)s+='<div style=\"margin-top:8px;font-size:18px;letter-spacing:2px\">'+E(d.a)+'</div>';"
+    "if(d.st>1)s+='<div style=\"font-size:12px;color:'+C.h+'\">🔥 норма '+d.st+' недель подряд</div>';"
+    "return s+'</div>'}" + WIDGET_JS + "</script>"
+)
+
+WIDGET_CALL = (
+    "<div id='r'></div><script>function view(d){"
+    "var s='<div style=\"background:'+C.b+';color:'+C.t+';font:14px system-ui,sans-serif;padding:14px;text-align:center\">';"
+    "s+='<div style=\"font-size:13px;color:'+C.h+'\">⚔️ ВЫЗОВ НА ДУЭЛЬ</div><div style=\"font-size:20px;font-weight:700;margin:4px 0\">'+E(d.a)+'</div>';"
+    "s+='<div style=\"display:flex;align-items:center;gap:8px;margin:10px 0\"><b style=\"width:44px\">'+d.p+'%</b>';"
+    "s+='<div style=\"flex:1;height:10px;border-radius:5px;background:'+C.s+'\"><div style=\"height:10px;border-radius:5px;width:'+d.p+'%;background:'+C.a+'\"></div></div><b style=\"width:44px\">'+(100-d.p)+'%</b></div>';"
+    "s+='<div style=\"font-size:12px;color:'+C.h+'\">'+E(d.a)+' '+d.ra+' — ты '+d.rb+' (шансы по Эло)</div>';"
+    "if(d.hh)s+='<div style=\"margin-top:6px\">Ваши дуэли: <b>'+E(d.hh)+'</b> (ты : он)</div>';"
+    "if(d.st)s+='<div style=\"margin-top:10px;font-weight:700;color:'+(d.st=='ok'?C.g:C.h)+'\">'+(d.st=='ok'?'✅ Вызов принят':d.st=='no'?'⏳ Не сейчас':'⌛ Вызов истёк')+'</div>';"
+    "return s+'</div>'}" + WIDGET_JS + "</script>"
+)
+
+WIDGET_UTS = (
+    "<div id='r'></div><script>function view(d){"
+    "var s='<div style=\"background:'+C.b+';color:'+C.t+';font:14px system-ui,sans-serif;padding:12px\">';"
+    "s+='<div style=\"color:'+C.h+';font-size:12px\">🏁 МИНИ-УТС · '+(d.st=='done'?'ЗАВЕРШЁН':'ИДЁТ')+'</div><div style=\"font-size:18px;font-weight:700\">'+E(d.t)+'</div>';"
+    "if(d.my){var m=d.my;s+='<div style=\"margin-top:10px;padding:10px;border-radius:10px;background:'+C.s+';border:1px solid '+(m[3]=='live'?C.a:C.s)+'\">'"
+    "+'<div style=\"font-size:11px;color:'+C.h+'\">'+(m[3]=='live'?'ТВОЙ МАТЧ СЕЙЧАС':m[3]=='wait'?'ЖДЁШЬ СОПЕРНИКА':m[3]=='out'?'ТЫ ВЫБЫЛ(А)':'ТВОЙ ПОСЛЕДНИЙ МАТЧ')+'</div>'"
+    "+'<b style=\"font-size:16px\">'+(m[0]?'vs '+E(m[0]):'—')+'</b>'+(m[1]?' <span style=\"color:'+C.h+'\">'+E(m[1])+'</span>':'')+(m[2]?'<div style=\"font-size:12px;color:'+C.h+'\">трасса: '+E(m[2])+'</div>':'')+'</div>'}"
+    "if(d.pl&&d.pl.length)s+='<div style=\"margin-top:10px;font-size:15px\">'+d.pl.map(function(x,i){return['🥇','🥈','🥉'][i]+' '+E(x)}).join('<br>')+'</div>';"
+    "if(d.cur&&d.cur.length){s+='<div style=\"margin-top:10px;font-size:11px;color:'+C.h+'\">'+E(d.rn||'СЕЙЧАС ИГРАЮТ')+'</div>';"
+    "d.cur.forEach(function(x){s+='<div style=\"display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid '+C.s+'\"><span>'+E(x[0])+' — '+E(x[1])+'</span><b>'+E(x[2]||'…')+'</b></div>'})}"
+    "s+='<div style=\"margin-top:8px;font-size:11px;color:'+C.h+'\">Полная сетка — в приложении клуба</div>';"
+    "return s+'</div>'}" + WIDGET_JS + "</script>"
+)
+
+
+def widget_fits(html):
+    return len(html.encode("utf-8")) <= 32768 and len(zlib.compress(html.encode("utf-8"), 9)) <= 4096
+
+
+def send_widget(chat_id, html, data, caption, height=None, markup=None):
+    # Возвращает id сообщения (0 — Телеграм не вернул его), None — виджет не отправился
+    cd = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    if len(cd.encode("utf-8")) > 1024 or not widget_fits(html):
+        return None
+    payload = {"chat_id": chat_id, "html": html, "chat_data": cd, "caption": caption[:1024]}
+    if height:
+        payload["height"] = height
+    if markup:
+        payload["reply_markup"] = markup
+    r = api("sendWidget", payload)
+    if not r.get("ok"):
+        return None
+    res = r.get("result")
+    return res.get("message_id", 0) if isinstance(res, dict) else 0
+
+
+def widget_data(chat_id, mid, data):
+    if mid:
+        api("editMessageWidgetData", {"chat_id": chat_id, "message_id": mid,
+                                      "chat_data": json.dumps(data, ensure_ascii=False, separators=(",", ":"))})
+
+
+# --- карточка пилота: /me (или /card) в личке бота ---
+def card_data(uid):
+    chat = club_chat()
+    names = club_names()
+    u = members.get(chat, {}).get(uid, {})
+    r = find_pilot(u.get("username", "")) if u.get("username") else None
+    name = col(r, 1) if r else pilot_name(chat, uid)
+    start, end = week_bounds()
+    lst = counted(chat, uid, names)
+    elo = elo_json(chat, names)
+    i = next((k for k, x in enumerate(elo) if x[0].lower() == name.lower()), None)
+    have = settings.get(chat, {}).get("ach", {}).get(str(uid), {})
+    d = {"n": name, "num": col(r, 0) if r else "", "w": duels_in(chat, uid, start, end), "nr": get_norm(chat),
+         "gl": settings.get(chat, {}).get("goals", {}).get(str(uid), 0), "st": norm_streak(chat, uid, get_norm(chat)),
+         "wr": round(sum(x["r"] == "win" for x in lst) / len(lst) * 100) if lst else None,
+         "a": "".join(ACH[c][0] for c in ACH if c in have)}
+    if i is not None:
+        d.update(e=elo[i][1], pl=i + 1, of=len(elo), dl=elo[i][3], h=elo_history(chat, names).get(name.lower(), []))
+    return d
+
+
+def card_caption(d):
+    return (f"👤 {d['n']}: {d['w']} из {d['nr']} дуэлей за неделю"
+            + (f", Эло {d['e']} ({d['pl']} место)" if d.get("e") else "") + (f", побед {d['wr']}%" if d.get("wr") is not None else ""))
+
+
+def card_cmd(msg):
+    uid = msg["from"]["id"]
+    if not club_chat() or not can_have_profile(msg["from"]):
+        reply(msg, "Карточка есть только у пилотов из таблицы клуба.")
+        return
+    remember(club_chat(), msg["from"])
+    d = card_data(uid)
+    if send_widget(uid, WIDGET_CARD, d, card_caption(d), height=340) is None:
+        reply(msg, card_caption(d))
+
+
+# --- турнир: живая карточка «мой матч» у каждого участника ---
+def uts_wdata(t, uid):
+    nm = lambda u: uts_name(u) if u else "…"
+    d = {"t": t["title"][:40], "st": t["state"]}
+    if t["state"] == "done":
+        d["pl"] = [nm(u) for u in t.get("places", [])]
+    mine = [m for m in t["matches"] if uid in (m.get("pa"), m.get("pb")) and not m.get("bye")]
+    live = next((m for m in mine if m.get("open") and not m["done"]), None)
+    if live:
+        opp = live["pb"] if live["pa"] == uid else live["pa"]
+        sc = f"{live['sa']}:{live['sb']}" if live["bo"] > 1 else ""
+        d["my"] = [nm(opp), sc, live.get("track", ""), "live"]
+    elif mine and t["state"] == "run":
+        last = [m for m in mine if m["done"]]
+        lost = sum(1 for m in last if m.get("l") == uid)
+        out = lost >= (2 if t.get("de") else 1) and t.get("fmt") != "rr"
+        m = last[-1] if last else None
+        if m:
+            opp = m["pb"] if m["pa"] == uid else m["pa"]
+            d["my"] = [nm(opp), "победа" if m.get("w") == uid else "поражение", "", "out" if out else "wait"]
+    cur = [m for m in t["matches"] if m.get("open") and not m["done"]][:8]
+    d["cur"] = [[nm(m["pa"])[:14], nm(m["pb"])[:14], f"{m['sa']}:{m['sb']}" if m["bo"] > 1 else ""] for m in cur]
+    if cur:
+        d["rn"] = cur[0]["name"][:30]
+    while len(json.dumps(d, ensure_ascii=False).encode("utf-8")) > 1000 and d["cur"]:
+        d["cur"].pop()
+    return d
+
+
+def uts_widgets_send(t):
+    t["wm"] = {}
+    for u in t["seeds"]:
+        mid = send_widget(u, WIDGET_UTS, uts_wdata(t, u), f"🏁 {t['title']}: твой матч и кто сейчас играет", height=320)
+        if mid:
+            t["wm"][str(u)] = mid
+
+
+def uts_widgets_refresh(t):
+    for u, mid in t.get("wm", {}).items():
+        widget_data(int(u), mid, uts_wdata(t, int(u)))
+
+
 DM_TEST_TEXT = ("✅ Тест: бот может писать вам в ЛС.\n"
                 "Сюда по понедельникам будет приходить список не выполнивших норму с кнопками варна, "
                 "а также сигналы о возможной накрутке дуэлей.")
@@ -4651,6 +4837,7 @@ HELP_TEXT = """📖 Команды бота
 /goal 30 — личная цель дуэлей на неделю (/goal off — снять)
 /teams (или «команды») — счёт командной недели
 /guide — в ЛС бота: коротко, как всё устроено (для новичков)
+/me (или /card) в ЛС бота — твоя карточка пилота: норма, Эло, график, ачивки
 
 🤖 Сам бот: в пятницу 18:00 напоминает тем, у кого меньше половины нормы, в понедельник 10:00 подводит
 итоги недели. Админам в ЛС приходит список не выполнивших норму с кнопками варна и сигналы о возможной
@@ -4753,6 +4940,9 @@ def handle(msg):
     if not is_group and (cmd == "guide" or (cmd == "start" and (args[:1] == ["guide"]
                                                                  or (not args and not profiles.get(chat_id, {}).get("onb"))))):
         onboarding(chat_id)
+        return
+    if not is_group and (cmd == "card" or (cmd == "profile" and not args)):
+        card_cmd(msg)
         return
     if cmd == "myid" and not is_group:
         reply(msg, f"Твой Telegram ID: {msg['from']['id']}")
