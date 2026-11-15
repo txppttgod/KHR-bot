@@ -4577,6 +4577,10 @@ WIDGET_UTS = (
 
 
 _widget_err = {"last": ""}  # почему Телеграм не принял последний виджет — видно владельцу в /me
+# С 13.11.2026 Телеграм не пускает обычных ботов к виджетам (INPUT_MEDIA_WIDGET_NOT_ALLOWED). После такого отказа
+# не стучимся зря: следующая попытка — через WIDGET_RETRY_H часов. Откроют доступ — виджеты заработают сами.
+WIDGET_RETRY_H = 6
+_widget_off = {"until": 0}
 
 
 def widget_fits(html):
@@ -4585,6 +4589,8 @@ def widget_fits(html):
 
 def send_widget(chat_id, html, data, caption, height=None, markup=None):
     # Возвращает id сообщения (0 — Телеграм не вернул его), None — виджет не отправился
+    if time.time() < _widget_off["until"]:
+        return None
     cd = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     if len(cd.encode("utf-8")) > 1024 or not widget_fits(html):
         return None
@@ -4596,6 +4602,8 @@ def send_widget(chat_id, html, data, caption, height=None, markup=None):
     r = api("sendWidget", payload)
     if not r.get("ok"):
         _widget_err["last"] = f"{r.get('error_code', '')} {r.get('description', 'нет ответа')}".strip()
+        if "WIDGET_NOT_ALLOWED" in _widget_err["last"]:
+            _widget_off["until"] = time.time() + WIDGET_RETRY_H * 3600
         print("Виджет не принят:", _widget_err["last"])
         return None
     res = r.get("result")
@@ -4642,7 +4650,11 @@ def card_cmd(msg):
     remember(club_chat(), msg["from"])
     d = card_data(uid)
     if send_widget(uid, WIDGET_CARD, d, card_caption(d), height=340) is None:
-        why = f"\n\n🔧 Виджет не принят: {_widget_err['last']}" if is_owner(uid) and _widget_err["last"] else ""
+        why = ""
+        if _widget_err["last"] and is_owner(uid):
+            why = (f"\n\n🔧 Виджеты пока закрыты Телеграмом для обычных ботов, поэтому карточка текстом. "
+                   f"Бот сам пробует снова раз в {WIDGET_RETRY_H} ч." if "WIDGET_NOT_ALLOWED" in _widget_err["last"]
+                   else f"\n\n🔧 Виджет не принят: {_widget_err['last']}")
         reply(msg, card_caption(d) + why)
 
 
