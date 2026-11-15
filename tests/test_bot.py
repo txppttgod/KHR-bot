@@ -13,6 +13,7 @@ class Resp:
         return self._d
 
 CSV = {"text": "№,Имя,Телеграм\n1,Эрнест,@ernest,5,2,10,Пилот\n"}
+WFAIL = [False]  # True — Телеграм «не принимает» виджеты (старое приложение)
 GEM = {"answer": None, "code": 200, "calls": 0, "fail": {}, "used": [], "think": []}
 MODELS = ["gemini-2.5-flash", "gemini-3-flash", "gemini-3-flash-lite", "gemini-3.1-flash-image", "gemini-3-pro",
           "gemini-3.1-flash-preview"]
@@ -44,6 +45,9 @@ def fake_post(url, json=None, **kw):
             return Resp({"error": "x"}, GEM["fail"][model])
         return Resp({"candidates": [{"content": {"parts": [{"text": __import__("json").dumps(GEM["answer"])}]}}]}, GEM["code"])
     method = url.rsplit("/", 1)[1]
+    if method == "sendWidget":
+        calls.append((method, json))
+        return Resp({"ok": not WFAIL[0], "result": {"message_id": 7000 + len(calls)}})
     if method == "sendMessage":
         calls.append((method, json))
         return Resp({"ok": True, "result": {"message_id": 9000 + len(calls)}})
@@ -767,14 +771,14 @@ check("lfg expires", any(m == "editMessageText" and "никто не откли�
 # вызовы
 r = send(USER, "/call @ernest")
 ok_btn = next((b["callback_data"] for b in btns(r) if b["callback_data"].startswith("dz:ok:")), "")
-check("call posted with buttons", ok_btn and "@ivan вызывает @ernest" in said(r) and any(p.get("chat_id") == OWNER and "вызывает тебя" in p.get("text", "") for m, p in r), r)
+check("call posted with buttons", ok_btn and "@ivan вызывает @ernest" in said(r) and any(p.get("chat_id") == OWNER and "вызывает тебя" in (p.get("text") or p.get("caption") or "") for m, p in r), r)
 r = send(USER, "/call @ernest"); check("call twice", "уже вызвал" in said(r), r)
 r = send(USER, "/call @ivan"); check("call yourself", "Себя" in said(r), r)
 r = send(USER, "/call"); check("call needs target", "Кого вызываем" in said(r), r)
 c = tap(MOD, ok_btn); check("only target answers call", "Ответить на вызов может только Ernest" in texts(c), [])
 c = tap(OWNER, ok_btn)
 check("call accepted", any(m == "editMessageText" and "принял(а) вызов Ivan" in p["text"] for m, p in c)
-      and sum(1 for m, p in c if m == "editMessageText") == 2
+      and sum(1 for m, p in c if m in ("editMessageText", "editMessageCaption")) == 2
       and any(p.get("chat_id") == USER and "принял(а) твой вызов" in p.get("text", "") for m, p in c), [])
 c = tap(OWNER, ok_btn); check("call answered once", "неактуален" in texts(c), [])
 r = send(MOD, "вызов", reply_to=USER); no_btn = next((b["callback_data"] for b in btns(r) if b["callback_data"].startswith("dz:no:")), "")
@@ -925,6 +929,42 @@ check("export csv", res["ok"] and res["n"] >= 2 and fname.startswith("duels_") a
 res2 = bot.admin_api(init_for(OWNER), "export", 1)
 check("export last week", res2["ok"] and res2["name"] != res["name"], [])
 check("bad export token", bot.export_file("nope") == (None, None), [])
+# ---------- виджеты в личке бота ----------
+check("widget html fits limits", all(bot.widget_fits(h) for h in (bot.WIDGET_CARD, bot.WIDGET_CALL, bot.WIDGET_UTS)), [])
+c = dm(USER, text="/me")
+w = next((p for m, p in c if m == "sendWidget"), None)
+cd = json.loads(w["chat_data"]) if w else {}
+check("pilot card widget", w and w["chat_id"] == USER and cd.get("n") == "Ivan" and "nr" in cd and "e" in cd and "Ivan:" in w["caption"]
+      and len(w["chat_data"].encode()) <= 1024, [("sendMessage", {"text": str(w)[:300]})])
+c = dm(6, text="/card"); check("card only for pilots", "только у пилотов" in texts(c) and not any(m == "sendWidget" for m, p in c), [])
+WFAIL[0] = True
+c = dm(USER, text="/card"); check("card falls back to text", any(m == "sendMessage" and "Ivan:" in p.get("text", "") for m, p in c), [])
+r = send(MOD, "/call @ivan")
+check("call falls back to text DM", any(m == "sendMessage" and p.get("chat_id") == USER and "вызывает тебя" in p.get("text", "") for m, p in r), r)
+WFAIL[0] = False
+bot.load_state(); bot.settings[CHAT].pop("dz", None); bot.save_state()
+r = send(USER, "/call @danya")
+w = next((p for m, p in r if m == "sendWidget"), None)
+okb = next((b["callback_data"] for b in btns(r) if b["callback_data"].startswith("dz:ok:")), "")
+check("call widget with odds and buttons", w and w["chat_id"] == MOD and "p" in json.loads(w["chat_data"]) and okb
+      and any(b["callback_data"] == okb for b in btns([("x", w)])), r)
+c = tap(MOD, okb)
+check("call widget updated on accept", any(m == "editMessageWidgetData" and '"st":"ok"' in p["chat_data"] for m, p in c)
+      and any(m == "editMessageCaption" and "принял(а)" in p["caption"] for m, p in c), [])
+bot.load_state(); bot.uts_all().clear(); bot.save_state()
+tidw, _ = create(USER)
+for x in (OWNER, MOD):
+    tap(x, f"ut:j:{tidw}")
+c = tap(USER2, f"ut:j:{tidw}")
+ws = [p for m, p in c if m == "sendWidget"]
+check("tournament widgets to every player", len(ws) == 4 and all(len(p["chat_data"].encode()) <= 1024 for p in ws)
+      and len(T(tidw)["wm"]) == 4, [("sendMessage", {"text": str([p["chat_data"] for p in ws])[:300]})])
+mine = json.loads(next(p for p in ws if p["chat_id"] == USER)["chat_data"])
+check("tournament widget shows my live match", mine.get("my") and mine["my"][3] == "live" and mine["cur"], [("sendMessage", {"text": str(mine)})])
+m1 = next(m for m in T(tidw)["matches"] if USER in (m["pa"], m["pb"]))
+c = tap(USER, f"ut:s:{tidw}:{m1['id']}")
+check("tournament widgets refresh after result", sum(1 for m, p in c if m == "editMessageWidgetData") == 4, [])
+bot.load_state(); bot.uts_all().clear(); bot.save_state()
 print("\n".join(checks))
 failed = sum(c.startswith("FAIL") for c in checks)
 print("FAILED:", failed, "of", len(checks))
