@@ -4576,6 +4576,9 @@ WIDGET_UTS = (
 )
 
 
+_widget_err = {"last": ""}  # почему Телеграм не принял последний виджет — видно владельцу в /me
+
+
 def widget_fits(html):
     return len(html.encode("utf-8")) <= 32768 and len(zlib.compress(html.encode("utf-8"), 9)) <= 4096
 
@@ -4592,6 +4595,8 @@ def send_widget(chat_id, html, data, caption, height=None, markup=None):
         payload["reply_markup"] = markup
     r = api("sendWidget", payload)
     if not r.get("ok"):
+        _widget_err["last"] = f"{r.get('error_code', '')} {r.get('description', 'нет ответа')}".strip()
+        print("Виджет не принят:", _widget_err["last"])
         return None
     res = r.get("result")
     return res.get("message_id", 0) if isinstance(res, dict) else 0
@@ -4637,7 +4642,8 @@ def card_cmd(msg):
     remember(club_chat(), msg["from"])
     d = card_data(uid)
     if send_widget(uid, WIDGET_CARD, d, card_caption(d), height=340) is None:
-        reply(msg, card_caption(d))
+        why = f"\n\n🔧 Виджет не принят: {_widget_err['last']}" if is_owner(uid) and _widget_err["last"] else ""
+        reply(msg, card_caption(d) + why)
 
 
 # --- турнир: живая карточка «мой матч» у каждого участника ---
