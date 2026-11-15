@@ -4374,6 +4374,112 @@ def goal_callback(cq):
     api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": res, "show_alert": True})
 
 
+def ru_plural(n, forms):
+    n = abs(n) % 100
+    return forms[2] if 11 <= n <= 14 else forms[0] if n % 10 == 1 else forms[1] if 2 <= n % 10 <= 4 else forms[2]
+
+
+# ---------- Итоги месяца в личку ----------
+# 1-го числа в 12:00 МСК каждый пилот, у которого были дуэли в норму, получает свои цифры за прошлый месяц.
+# /month в личке бота — текущий месяц «пока».
+MONTH_DAY, MONTH_HOUR = 1, 12
+MONTHS_NOM = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+MONTHS_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября",
+              "декабря"]
+
+
+def month_bounds(day):
+    start = day.replace(day=1)
+    return start, (start + datetime.timedelta(days=32)).replace(day=1) - datetime.timedelta(days=1)
+
+
+def month_ctx(chat_id, start, end, names):
+    # Общее для всех пилотов: рейтинг Эло на начало и конец месяца, сколько дуэлей у каждого (для места в клубе)
+    return {"e0": elo_table(chat_id, names, until=start.isoformat()),
+            "e1": elo_table(chat_id, names, until=(end + datetime.timedelta(days=1)).isoformat()),
+            "n": [len(counted(chat_id, u, names, start, end)) for u in club_uids(chat_id) if pilot_name(chat_id, u)]}
+
+
+def month_text(chat_id, uid, start, end, partial=False, names=None, ctx=None):
+    names = club_names() if names is None else names
+    lst = counted(chat_id, uid, names, start, end)
+    if not lst:
+        return ""
+    ctx = ctx or month_ctx(chat_id, start, end, names)
+    who = pilot_name(chat_id, uid).strip()
+    n, w = len(lst), sum(d["r"] == "win" for d in lst)
+    rank = 1 + sum(1 for c in ctx["n"] if c > n)
+    lines = [f"⚔️ Дуэлей в норму: {n} ({rank}-е место в клубе)", f"🏆 Победы: {w} из {n} — {round(w / n * 100)}%"]
+    e0, e1 = ctx["e0"].get(who.lower()), ctx["e1"].get(who.lower())
+    if e1:
+        r0, r1 = (e0[1] if e0 else ELO_START), e1[1]
+        dl = round(r1 - r0)
+        lines.append(f"📈 Эло: {round(r0)} → {round(r1)} ({'+' if dl >= 0 else ''}{dl})")
+    per = {}
+    for d in lst:
+        k = track_key(d.get("t"))
+        if k:
+            m = per.setdefault(k, [d["t"].strip(), 0, 0])
+            m[1] += 1
+            m[2] += d["r"] == "win"
+    best = max(per.values(), key=lambda m: (m[2], m[1]), default=None)
+    if best and best[2]:
+        lines.append(f"🗺 Лучшая карта: {best[0]} — {best[2]} {ru_plural(best[2], ('победа', 'победы', 'побед'))} из {best[1]}")
+    top = max(lst, key=lambda d: own_score(d["s"]))
+    lines.append(f"🚀 Лучший счёт: {own_score(top['s']):g}" + (f" ({top['t'].strip()})" if top.get("t") else ""))
+    norm, ref = get_norm(chat_id), min(end, msk_today() - datetime.timedelta(days=1))
+    mon = start + datetime.timedelta(days=(7 - start.weekday()) % 7)  # недели, которые начались в этом месяце и уже закончились
+    weeks = []
+    while mon <= end:
+        if mon + datetime.timedelta(days=6) <= ref:
+            weeks.append(mon)
+        mon += datetime.timedelta(days=7)
+    if weeks:
+        ok = sum(1 for m in weeks if duels_in(chat_id, uid, m, m + datetime.timedelta(days=6)) >= norm)
+        lines.append(f"✅ Норма: {ok} из {len(weeks)} {ru_plural(len(weeks), ('недели', 'недель', 'недель'))}")
+    med = [0, 0, 0]
+    for h in settings.get(chat_id, {}).get("uts_hist", []):
+        if start.isoformat() <= h["d"] <= end.isoformat() and uid in h["places"][:3]:
+            med[h["places"].index(uid)] += 1
+    if any(med):
+        lines.append(f"🏁 Мини-УТС: 🥇 {med[0]} · 🥈 {med[1]} · 🥉 {med[2]}")
+    have = settings.get(chat_id, {}).get("ach", {}).get(str(uid), {})
+    new = [c for c in ACH if c in have and start.isoformat() <= have[c] <= end.isoformat()]
+    if new:
+        lines.append("🏅 Новые ачивки: " + ", ".join(f"{ACH[c][0]} {ACH[c][1]}" for c in new))
+    head = (f"📅 Твой {MONTHS_NOM[start.month - 1]} пока" if partial
+            else f"📅 Итоги {MONTHS_GEN[start.month - 1]}, {who}")
+    return head + "\n\n" + "\n".join(lines) + "\n\nПодробности — в приложении клуба."
+
+
+def monthly_report(chat_id, now):
+    start, end = month_bounds(now.date() - datetime.timedelta(days=1))  # 1-го числа «вчера» — последний день прошлого месяца
+    names = club_names()
+    ctx = month_ctx(chat_id, start, end, names)
+    sent = 0
+    for p in duel_people(chat_id):
+        if not p["uid"] or not p["tg"]:
+            continue
+        text = month_text(chat_id, p["uid"], start, end, names=names, ctx=ctx)
+        if text:
+            sent += bool(api("sendMessage", {"chat_id": p["uid"], "text": text}).get("ok"))
+    print(f"Итоги месяца в ЛС: доставлено {sent}")
+    return sent
+
+
+def month_cmd(msg):
+    if msg["chat"]["type"] != "private":
+        reply(msg, f"Итоги месяца — в личке бота: напиши @{BOT_USERNAME} команду /month")
+        return
+    if not club_chat() or not can_have_profile(msg["from"]):
+        reply(msg, "Итоги месяца есть только у пилотов из таблицы клуба.")
+        return
+    remember(club_chat(), msg["from"])
+    start, _ = month_bounds(msk_today())
+    text = month_text(club_chat(), msg["from"]["id"], start, msk_today(), partial=True)
+    reply(msg, text or f"В {MONTHS_GEN[start.month - 1][:-1]}е у тебя пока нет дуэлей в норму.")
+
+
 def goals_report(chat_id, now):
     # Понедельник: каждому, у кого есть цель, — итог прошлой недели в ЛС
     start, end = week_bounds(now.date(), back=1)
@@ -4760,6 +4866,10 @@ def scheduler_tick(now):
                 conf["reminded"] = week
                 friday_reminder(chat_id, now)
                 changed = True
+            if now.day == MONTH_DAY and now.hour >= MONTH_HOUR and conf.get("monthly") != now.strftime("%Y-%m"):
+                conf["monthly"] = now.strftime("%Y-%m")
+                monthly_report(chat_id, now)
+                changed = True
             if now.hour >= PING_HOUR and conf.get("pinged_day") != now.date().isoformat():
                 conf["pinged_day"] = now.date().isoformat()
                 soft_ping(chat_id, now)
@@ -4856,6 +4966,7 @@ HELP_TEXT = """📖 Команды бота
 /teams (или «команды») — счёт командной недели
 /guide — в ЛС бота: коротко, как всё устроено (для новичков)
 /me (или /card) в ЛС бота — твоя карточка пилота: норма, Эло, график, ачивки
+/month — в ЛС бота: твой месяц пока (а 1-го числа итоги прошлого месяца приходят сами)
 
 🤖 Сам бот: в пятницу 18:00 напоминает тем, у кого меньше половины нормы, в понедельник 10:00 подводит
 итоги недели. Админам в ЛС приходит список не выполнивших норму с кнопками варна и сигналы о возможной
@@ -4961,6 +5072,9 @@ def handle(msg):
         return
     if not is_group and (cmd == "card" or (cmd == "profile" and not args)):
         card_cmd(msg)
+        return
+    if cmd == "month":
+        month_cmd(msg)
         return
     if cmd == "myid" and not is_group:
         reply(msg, f"Твой Telegram ID: {msg['from']['id']}")
@@ -5156,7 +5270,7 @@ PUBLIC_MENU = [
     ("norm", "Норма дуэлей за неделю"), ("normall", "Норма дуэлей у всех"),
     ("recheck", "Перечитать скрин (ответом)"), ("lfg", "Ищу дуэль: найти соперника"),
     ("call", "Вызвать на дуэль: /call @ник"), ("goal", "Личная цель на неделю"),
-    ("teams", "Счёт командной недели"), ("myprofile", "Мой профиль: фото машины в ливрее клуба"),
+    ("teams", "Счёт командной недели"), ("month", "Мои итоги месяца (в личке бота)"), ("myprofile", "Мой профиль: фото машины в ливрее клуба"),
     ("app", "Таблицы клуба"),
 ]
 ADMIN_MENU = PUBLIC_MENU + [
