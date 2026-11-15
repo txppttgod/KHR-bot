@@ -80,6 +80,7 @@ bot = types.ModuleType("bot")
 exec(compile(src, "bot.py", "exec"), bot.__dict__)
 # В старых проверках дуэли с выдуманными соперниками и маленькими баллами — правила нормы проверяются отдельно ниже
 bot.MIN_SCORE, bot.CLUB_ONLY = 0, False
+bot.MONTH_HOUR = 99  # итоги месяца проверяются отдельно в конце: иначе проверки планировщика зависели бы от даты запуска
 
 CHAT = -1001
 OWNER, ADMIN, MOD, USER, USER2 = 1, 2, 3, 4, 5
@@ -984,6 +985,26 @@ check("call during pause goes as text", not any(m == "sendWidget" for m, p in r)
 bot._widget_off["until"] = time.time() - 1
 c = dm(USER, text="/card"); check("widgets retried after pause", any(m == "sendWidget" for m, p in c), [])
 bot.load_state(); bot.settings[CHAT].pop("dz", None); bot.save_state()
+# ---------- итоги месяца ----------
+check("month bounds", bot.month_bounds(_dt.date(2026, 11, 15)) == (_dt.date(2026, 11, 1), _dt.date(2026, 11, 30))
+      and bot.month_bounds(_dt.date(2026, 12, 31)) == (_dt.date(2026, 12, 1), _dt.date(2026, 12, 31)), [])
+wins = ("победа", "победы", "побед")
+check("russian plural", [bot.ru_plural(n, wins) for n in (1, 3, 5, 11, 21, 22)] == ["победа", "победы", "побед", "побед", "победа", "победы"], [])
+tshot(USER, "Ernest", [("win", "185 / 160", "Ebisu Minami"), ("win", "175 / 170", "Ebisu Minami"), ("loss", "150 / 160", "Springstone")])
+c = dm(USER, text="/month"); mtxt = texts(c)
+check("month so far in DM", f"📅 Твой {bot.MONTHS_NOM[today.month - 1]} пока" in mtxt and "Дуэлей в норму:" in mtxt and "место в клубе" in mtxt
+      and "Победы:" in mtxt and "Лучшая карта:" in mtxt and "Лучший счёт:" in mtxt and "Эло:" in mtxt, [("sendMessage", {"text": mtxt})])
+c = dm(6, text="/month"); check("month only for pilots", "только у пилотов" in texts(c), [])
+r = send(USER, "/month"); check("month in group points to DM", "в личке бота" in said(r), r)
+bot.MONTH_HOUR = 12
+first = _dt.datetime.combine(bot.month_bounds(today)[1] + _dt.timedelta(days=1), _dt.time(12, 5))
+bot.load_state(); bot.settings[CHAT].pop("monthly", None); bot.save_state()
+calls.clear(); bot.scheduler_tick(first)
+md = [p for m, p in calls if m == "sendMessage" and p.get("text", "").startswith(f"📅 Итоги {bot.MONTHS_GEN[today.month - 1]}")]
+check("monthly report on the 1st", any(p["chat_id"] == USER and "Ivan" in p["text"] and "Дуэлей в норму" in p["text"] for p in md)
+      and all(p["chat_id"] != 6 for p in md), [("sendMessage", p) for p in md])
+calls.clear(); bot.scheduler_tick(first + _dt.timedelta(hours=1))
+check("monthly report once", not any(m == "sendMessage" and p.get("text", "").startswith("📅 Итоги") for m, p in calls), [])
 print("\n".join(checks))
 failed = sum(c.startswith("FAIL") for c in checks)
 print("FAILED:", failed, "of", len(checks))
