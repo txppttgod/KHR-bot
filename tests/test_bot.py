@@ -47,7 +47,9 @@ def fake_post(url, json=None, **kw):
     method = url.rsplit("/", 1)[1]
     if method == "sendWidget":
         calls.append((method, json))
-        return Resp({"ok": not WFAIL[0], "result": {"message_id": 7000 + len(calls)}})
+        if WFAIL[0]:
+            return Resp({"ok": False, "error_code": 400, "description": "Bad Request: method not found"})
+        return Resp({"ok": True, "result": {"message_id": 7000 + len(calls)}})
     if method == "sendMessage":
         calls.append((method, json))
         return Resp({"ok": True, "result": {"message_id": 9000 + len(calls)}})
@@ -939,6 +941,7 @@ check("pilot card widget", w and w["chat_id"] == USER and cd.get("n") == "Ivan" 
 c = dm(6, text="/card"); check("card only for pilots", "только у пилотов" in texts(c) and not any(m == "sendWidget" for m, p in c), [])
 WFAIL[0] = True
 c = dm(USER, text="/card"); check("card falls back to text", any(m == "sendMessage" and "Ivan:" in p.get("text", "") for m, p in c), [])
+c = dm(OWNER, text="/card"); check("owner sees why widget failed", "Виджет не принят: 400 Bad Request: method not found" in texts(c), [])
 r = send(MOD, "/call @ivan")
 check("call falls back to text DM", any(m == "sendMessage" and p.get("chat_id") == USER and "вызывает тебя" in p.get("text", "") for m, p in r), r)
 WFAIL[0] = False
