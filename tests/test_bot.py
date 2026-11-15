@@ -48,7 +48,8 @@ def fake_post(url, json=None, **kw):
     if method == "sendWidget":
         calls.append((method, json))
         if WFAIL[0]:
-            return Resp({"ok": False, "error_code": 400, "description": "Bad Request: method not found"})
+            why = WFAIL[0] if isinstance(WFAIL[0], str) else "Bad Request: method not found"
+            return Resp({"ok": False, "error_code": 400, "description": why})
         return Resp({"ok": True, "result": {"message_id": 7000 + len(calls)}})
     if method == "sendMessage":
         calls.append((method, json))
@@ -968,6 +969,21 @@ m1 = next(m for m in T(tidw)["matches"] if USER in (m["pa"], m["pb"]))
 c = tap(USER, f"ut:s:{tidw}:{m1['id']}")
 check("tournament widgets refresh after result", sum(1 for m, p in c if m == "editMessageWidgetData") == 4, [])
 bot.load_state(); bot.uts_all().clear(); bot.save_state()
+# Телеграм закрыл виджеты для обычных ботов: пауза в попытках и понятная подсказка владельцу
+WFAIL[0] = "Bad Request: INPUT_MEDIA_WIDGET_NOT_ALLOWED"
+c = dm(OWNER, text="/card")
+check("not allowed -> text and clear hint for owner", "закрыты Телеграмом" in texts(c) and "Ernest:" in texts(c)
+      and sum(1 for m, p in c if m == "sendWidget") == 1, [("sendMessage", {"text": texts(c)})])
+WFAIL[0] = False
+c = dm(USER, text="/card")
+check("widgets paused after not allowed", not any(m == "sendWidget" for m, p in c) and "Ivan:" in texts(c)
+      and "закрыты" not in texts(c), [("sendMessage", {"text": texts(c)})])
+r = send(USER, "/call @danya")
+check("call during pause goes as text", not any(m == "sendWidget" for m, p in r)
+      and any(m == "sendMessage" and p.get("chat_id") == MOD and "вызывает тебя" in p.get("text", "") for m, p in r), r)
+bot._widget_off["until"] = time.time() - 1
+c = dm(USER, text="/card"); check("widgets retried after pause", any(m == "sendWidget" for m, p in c), [])
+bot.load_state(); bot.settings[CHAT].pop("dz", None); bot.save_state()
 print("\n".join(checks))
 failed = sum(c.startswith("FAIL") for c in checks)
 print("FAILED:", failed, "of", len(checks))
